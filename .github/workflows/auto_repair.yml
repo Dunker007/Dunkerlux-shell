@@ -1,0 +1,300 @@
+name: DLX Auto-Repair
+
+on:
+  # Auto-run when Self-Heal completes; we act only on failure
+  workflow_run:
+    workflows: ["DLX Self-Heal"]
+    types: [completed]
+  # Manual run to repair immediately
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Target branch to repair"
+        required: false
+        default: "feature/self-heal-v0_2_0"
+      dv_entity_set:
+        description: "Dataverse entity set override (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  repair:
+    # Run if manual, or if Self-Heal failed
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve target branch
+      # Prefer the failed run's branch; else manual input
+        id: ctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isManual = context.eventName === 'workflow_dispatch';
+            const branch = isManual
+              ? (core.getInput('branch') || 'feature/self-heal-v0_2_0')
+              : (context.payload.workflow_run?.head_branch || 'feature/self-heal-v0_2_0');
+            core.info(`Auto-Repair targeting branch: ${branch}`);
+            core.setOutput('branch', branch);
+
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ctx.outputs.branch }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "dlx-ops"
+          git config user.email "ops@dlx.local"
+
+      - name: Apply hotfix to self_heal.yml (robust secrets + setup-python + safe heartbeat)
+        shell: bash
+        run: |
+          mkdir -p .github/workflows
+          cat > .github/workflows/self_heal.yml <<'YML'
+          name: DLX Self-Heal
+
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: "*/15 * * * *"
+            workflow_run:
+              workflows: ["Repo Health"]
+              types: [completed]
+
+          permissions:
+            contents: write
+            issues: write
+            id-token: write
+
+          concurrency:
+            group: dlx-self-heal
+            cancel-in-progress: false
+
+          jobs:
+            self_heal:
+              runs-on: [self-hosted, windows, kamerta]
+              env:
+                DLX_AUTOMATION_MODE: ${{ vars.DLX_AUTOMATION_MODE || 'FULL' }}
+                DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '0' }}
+                KV_NAME: kv-dlx-crypto
+                HOSTNAME: Kamerta
+                DV_ENTITY_SET: ${{ vars.DV_ENTITY_SET || 'dlx_heartbeats' }}
+
+              steps:
+                - name: Preflight – Killswitch Gate
+                  if: env.DLX_KILLSWITCH == '1'
+                  run: |
+                    echo "DLX_KILLSWITCH=1 → Skipping by policy."
+                  shell: pwsh
+
+                - name: Checkout
+                  if: env.DLX_KILLSWITCH != '1'
+                  uses: actions/checkout@v4
+
+                - name: Setup Python
+                  if: env.DLX_KILLSWITCH != '1'
+                  uses: actions/setup-python@v5
+                  with:
+                    python-version: '3.x'
+
+                - name: Resolve Dataverse Secrets (GH first, KV if possible)
+                  if: env.DLX_KILLSWITCH != '1'
+                  id: dv
+                  shell: pwsh
+                  env:
+                    GH_DV_URL: ${{ secrets.DV_URL }}
+                    GH_DV_TOKEN: ${{ secrets.DV_TOKEN }}
+                    AZ_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+                    AZ_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+                    AZ_SUB_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+                  run: |
+                    $ErrorActionPreference = "Continue"
+
+                    # 1) Prefer GitHub Secrets
+                    $dvUrl   = $env:GH_DV_URL
+                    $dvToken = $env:GH_DV_TOKEN
+
+                    # 2) Try Key Vault ONLY if GH secrets missing AND az exists
+                    $azOk = $false
+                    try { az -v *> $null; if ($LASTEXITCODE -eq 0) { $azOk = $true } } catch {}
+                    if (([string]::IsNullOrWhiteSpace($dvUrl) -or [string]::IsNullOrWhiteSpace($dvToken)) -and $azOk -and -not [string]::IsNullOrWhiteSpace($env:AZ_CLIENT_ID)) {
+                      try {
+                        $dvUrl   = az keyvault secret show --vault-name $env:KV_NAME --name "DV-URL"   --query value -o tsv
+                        $dvToken = az keyvault secret show --vault-name $env:KV_NAME --name "DV-TOKEN" --query value -o tsv
+                      } catch { Write-Host "KV fetch failed: $($_.Exception.Message)" }
+                    } elseif (([string]::IsNullOrWhiteSpace($dvUrl) -or [string]::IsNullOrWhiteSpace($dvToken))) {
+                      Write-Host "Azure CLI not available or OIDC vars missing—skipping KV."
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($dvUrl))   { "DV_URL=$dvUrl"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+                    if (-not [string]::IsNullOrWhiteSpace($dvToken)) { "DV_TOKEN=$dvToken" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+
+                    if ([string]::IsNullOrWhiteSpace($dvUrl) -or [string]::IsNullOrWhiteSpace($dvToken)) {
+                      Write-Warning "Dataverse secrets not resolved. Heartbeat will be skipped, but status JSON will still be published."
+                      "SKIP_HEARTBEAT=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                    } else {
+                      "SKIP_HEARTBEAT=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                    }
+
+                - name: Manifest Check
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: |
+                    python scripts/manifest_check.py --manifest Lux_Boot_Manifest.v2.json --schema scripts/Lux_Boot_Manifest.schema.v2.json
+
+                - name: Heartbeat → Dataverse
+                  if: env.DLX_KILLSWITCH != '1' && env.SKIP_HEARTBEAT != '1'
+                  env:
+                    DV_URL: ${{ env.DV_URL }}
+                    DV_TOKEN: ${{ env.DV_TOKEN }}
+                    DV_ENTITY_SET: ${{ env.DV_ENTITY_SET }}
+                    NOTE: "self_heal.yml"
+                  shell: pwsh
+                  run: |
+                    python scripts/heartbeat_post.py --host $env:HOSTNAME --status "OK" --note $env:NOTE
+
+                - name: Publish Status JSON (Always-On Write)
+                  if: always()
+                  shell: pwsh
+                  run: |
+                    $now = [DateTime]::UtcNow.ToString("o")
+                    $payload = @{
+                      host       = "${{ env.HOSTNAME }}"
+                      mode       = "${{ env.DLX_AUTOMATION_MODE }}"
+                      killswitch = "${{ env.DLX_KILLSWITCH }}"
+                      lastRunUtc = $now
+                      workflow   = "self_heal.yml"
+                      status     = "${{ job.status }}"
+                    } | ConvertTo-Json -Depth 3
+                    New-Item -ItemType Directory -Force -Path "docs/status" | Out-Null
+                    $payload | Out-File -FilePath "docs/status/self_heal.json" -Encoding utf8
+
+                - name: Commit status.json
+                  if: always()
+                  uses: stefanzweifel/git-auto-commit-action@v5
+                  with:
+                    commit_message: "chore(ops): update self_heal status [skip ci]"
+                    file_pattern: docs/status/self_heal.json
+
+                - name: Tripwires & Alerts
+                  if: failure()
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const title = "Self-Heal Failure Tripwire";
+                      const body  = `Run: ${context.runNumber}\nWorkflow: self_heal.yml\nMode: ${process.env.DLX_AUTOMATION_MODE}\nHost: ${process.env.HOSTNAME}\nAction: review failure logs and re-run`;
+                      await github.rest.issues.create({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        title, body, labels: ["ops", "self-heal", "critical"]
+                      });
+          YML
+
+      - name: Apply hotfix to heartbeat_post.py (entity override + clearer errors)
+        shell: bash
+        run: |
+          mkdir -p scripts
+          cat > scripts/heartbeat_post.py <<'PY'
+          import argparse, json, os, sys, time
+          from urllib import request, error
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--host", required=True)
+              ap.add_argument("--status", required=True)
+              ap.add_argument("--note", default="")
+              args = ap.parse_args()
+
+              dv_url = os.getenv("DV_URL")
+              dv_token = os.getenv("DV_TOKEN")
+              entity = os.getenv("DV_ENTITY_SET", "dlx_heartbeats")
+
+              if not dv_url or not dv_token:
+                  print("[heartbeat] Missing DV_URL or DV_TOKEN in env", file=sys.stderr)
+                  sys.exit(2)
+
+              api = dv_url.rstrip("/") + f"/api/data/v9.2/{entity}"
+              payload = {
+                  "dlx_host": args.host,
+                  "dlx_status": args.status,
+                  "dlx_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "dlx_seq": int(time.time()),
+                  "dlx_note": args.note
+              }
+              data = json.dumps(payload).encode("utf-8")
+              req = request.Request(api, data=data, method="POST", headers={
+                  "Authorization": f"Bearer {dv_token}",
+                  "Content-Type": "application/json; charset=utf-8",
+                  "OData-Version": "4.0",
+                  "Accept": "application/json"
+              })
+              try:
+                  with request.urlopen(req, timeout=30) as resp:
+                      body = resp.read().decode("utf-8", "ignore")
+                      print("[heartbeat] Sent OK]:", resp.status, body)
+              except error.HTTPError as e:
+                  msg = e.read().decode("utf-8", "ignore")
+                  print(f"[heartbeat] HTTP {e.code} → {msg}", file=sys.stderr)
+                  sys.exit(1)
+              except Exception as e:
+                  print("[heartbeat] ERROR:", e, file=sys.stderr)
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Set DV_ENTITY_SET repo variable if provided
+        if: ${{ github.event.inputs.dv_entity_set != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const name = 'DV_ENTITY_SET';
+            const value = core.getInput('dv_entity_set');
+            try {
+              await github.request('PATCH /repos/{owner}/{repo}/actions/variables/{name}', {owner, repo, name, value});
+            } catch (e) {
+              await github.request('POST /repos/{owner}/{repo}/actions/variables', {owner, repo, name, value});
+            }
+            core.info(`DV_ENTITY_SET set to ${value}`);
+
+      - name: Commit & push hotfix
+        id: push
+        run: |
+          git add .
+          git commit -m "fix(ops): auto-repair self-heal & heartbeat [skip ci]" || echo "No changes to commit"
+          git push origin ${{ steps.ctx.outputs.branch }}
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Re-dispatch Self-Heal on target branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const ref = '${{ steps.ctx.outputs.branch }}';
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: "self_heal.yml", ref, inputs: {}
+            });
+
+      - name: Comment on PR (if any)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const head = `${owner}:${{ steps.ctx.outputs.branch }}`;
+            const prs = await github.rest.pulls.list({owner, repo, state: "open", head});
+            const body = `Auto-Repair applied on \`${head}\`.\n- Commit: \`${{ steps.push.outputs.sha }}\`\n- Patched self_heal.yml & heartbeat_post.py\n- Re-dispatched Self-Heal.`;
+            if (prs.data.length) {
+              await github.rest.issues.createComment({owner, repo, issue_number: prs.data[0].number, body});
+            } else {
+              await github.rest.issues.create({
+                owner, repo, title: "Auto-Repair applied", body, labels: ["ops","self-heal","auto-repair"]
+              });
+            }

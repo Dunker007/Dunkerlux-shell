@@ -1,0 +1,277 @@
+name: DLX One-Time Bootstrap
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # create/commit files and PR
+  actions: write           # dispatch other workflows
+  pull-requests: write     # open/manage PRs
+  id-token: write          # future Azure OIDC use
+
+env:
+  REPO_OWNER: ${{ github.repository_owner }}
+  REPO_NAME:  ${{ github.event.repository.name }}
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+jobs:
+  setup_repo:
+    name: Setup repo files + kill-switch (no PAT)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+
+      - name: Create/Update repo variable DLX_KILLSWITCH=1
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const resp = await github.request('GET /repos/{owner}/{repo}/actions/variables', {
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            const hasVar = resp.data.variables.some(v => v.name === 'DLX_KILLSWITCH');
+            if (!hasVar) {
+              await github.request('POST /repos/{owner}/{repo}/actions/variables', {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'DLX_KILLSWITCH',
+                value: '1'
+              });
+            } else {
+              await github.request('PATCH /repos/{owner}/{repo}/actions/variables/{name}', {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'DLX_KILLSWITCH',
+                value: '1'
+              });
+            }
+
+      - name: Write Self-Heal workflow (kill-switch aware)
+        shell: bash
+        run: |
+          mkdir -p .github/workflows scripts/self_heal docs
+          cat > .github/workflows/self_heal.yml <<'YML'
+          name: DLX Self-Heal
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: "*/15 * * * *"
+          permissions:
+            contents: write
+            actions: write
+          env:
+            DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '1' }}
+          jobs:
+            sentinel:
+              runs-on: self-hosted
+              steps:
+                - uses: actions/checkout@v4
+                - name: Honor kill-switch
+                  if: env.DLX_KILLSWITCH == '1'
+                  run: echo "Kill-switch ON: observe-only mode."
+                - name: Heartbeat (bridge file)
+                  shell: pwsh
+                  run: |
+                    $ts = Get-Date -Format "s"
+                    New-Item -ItemType Directory -Force -Path C:\DLX\OneDriveBridge | Out-Null
+                    Set-Content -Path C:\DLX\OneDriveBridge\LAST_HEARTBEAT.txt -Value "$env:COMPUTERNAME,OK,$ts,0,self-heal"
+                - name: Auth repair (stub, gated)
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: Write-Host "Auth repair stub"
+                - name: Repo sync (stub, gated)
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: Write-Host "Repo sync stub"
+                - name: Actions rerun (stub, gated)
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: Write-Host "Actions rerun stub"
+                - name: Deps fix (stub, gated)
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: Write-Host "Deps fix stub"
+          YML
+
+      - name: Write Agent Inventory workflow (inline harvest, no gh)
+        shell: bash
+        run: |
+          cat > .github/workflows/agent_inventory.yml <<'YML'
+          name: Agent Inventory
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: "13 7 * * 1"
+          permissions:
+            contents: write
+            actions: read
+          env:
+            DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '1' }}
+          jobs:
+            harvest:
+              runs-on: self-hosted
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Kamerta Harvest (Windows) - metadata only
+                  shell: pwsh
+                  run: |
+                    $ErrorActionPreference = "Stop"
+                    $OutDir = "C:\DLX\Inventory"
+                    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+
+                    $inv = [ordered]@{
+                      collectedAt = (Get-Date).ToString("s")
+                      host        = $env:COMPUTERNAME
+                      killSwitch  = [Environment]::GetEnvironmentVariable("DLX_KILLSWITCH","Machine")
+                      windows     = [ordered]@{}
+                      runner      = [ordered]@{}
+                      bridge      = [ordered]@{}
+                    }
+                    $inv.windows.services = Get-Service | Where-Object { $_.DisplayName -match "DLX|Lux|Self[- ]?Heal" } | Select Name,DisplayName,Status
+                    $inv.windows.tasks = Get-ScheduledTask | Where-Object { $_.TaskName -match "^(DLX_|Self-Heal|Lux_)" -or $_.TaskPath -match "DLX|Lux|Self[- ]?Heal" } |
+                      ForEach-Object {
+                        $i = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath
+                        [ordered]@{ TaskName=$_.TaskName; State=$_.State; LastRun=$i.LastRunTime; NextRun=$i.NextRunTime }
+                      }
+                    $runnerRoot = "C:\actions-runner"
+                    if (Test-Path $runnerRoot) {
+                      $inv.runner.services = Get-Service | Where-Object { $_.Name -like "actions.runner*" } | Select Name,Status,DisplayName
+                    }
+                    $bridgeDir = "C:\DLX\OneDriveBridge"
+                    $inv.bridge.markers = @("KILL_SWITCH.ON","MAINTENANCE.ON","LAST_HEARTBEAT.txt") | % {
+                      $f = Join-Path $bridgeDir $_; if (Test-Path $f) { @{ name=$_; lastWrite=(Get-Item $f).LastWriteTime } }
+                    }
+                    $json = Join-Path $OutDir "kamerta_inventory.json"
+                    $inv | ConvertTo-Json -Depth 6 | Out-File -FilePath $json -Encoding UTF8
+
+                - name: Build Findings
+                  shell: pwsh
+                  run: |
+                    $OutDir = "C:\DLX\Inventory"
+                    $F = Join-Path $OutDir "FINDINGS.md"
+                    $kam = Get-Content (Join-Path $OutDir "kamerta_inventory.json") -Raw | ConvertFrom-Json
+                    $issues = @()
+                    if ($kam.killSwitch -ne "1") { $issues += "- Kill-switch not enforced on host (expected 1 during review)." }
+                    if (-not $kam.windows.tasks) { $issues += "- No DLX or Self-Heal tasks found; ensure Task Scheduler is configured." }
+
+                    $md = @()
+                    $md += "# DLX Findings"
+                    $md += ""
+                    $md += "Collected: $($kam.collectedAt)"
+                    $md += "Host: $($kam.host)"
+                    $md += ""
+                    $md += "## Kill-Switch"
+                    $md += "- Machine: $($kam.killSwitch)"
+                    $md += ""
+                    $md += "## Windows Scheduled Tasks (filtered)"
+                    $md += "```"
+                    $kam.windows.tasks | ForEach-Object { "$($_.TaskName) | State=$($_.State) | Last=$($_.LastRun) | Next=$($_.NextRun)" } | Out-String
+                    $md += "```"
+                    $md += ""
+                    $md += "## Issues & Risks"
+                    if ($issues.Count -eq 0) { $md += "- None critical detected in initial pass." } else { $md += $issues }
+                    $md -join "`r`n" | Set-Content (Join-Path $OutDir "FINDINGS.md") -Encoding UTF8
+
+                - name: Upload artifact
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: dlx-agent-inventory
+                    path: C:\DLX\Inventory\*
+
+                - name: Commit Findings into docs/ and open PR
+                  uses: peter-evans/create-pull-request@v6
+                  with:
+                    commit-message: "chore: add DLX FINDINGS snapshot"
+                    branch: chore/findings-auto
+                    title: "Findings: Agent Inventory Snapshot"
+                    body: "Automated findings generated by Agent Inventory."
+                    labels: automation,findings
+          YML
+
+      - name: Write IssueOps workflow (arm it / scan / greenlight) — no gh
+        shell: bash
+        run: |
+          cat > .github/workflows/issueops.yml <<'YML'
+          name: IssueOps Control
+          on:
+            issues:
+              types: [opened, edited, labeled]
+          permissions:
+            contents: write
+            issues: write
+            actions: write
+          jobs:
+            route:
+              runs-on: ubuntu-latest
+              steps:
+                - name: Parse command
+                  id: parse
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const title = (context.payload.issue.title || "").toLowerCase();
+                      let cmd = "";
+                      if (title.includes("arm it")) cmd = "arm";
+                      if (title.includes("scan")) cmd = "scan";
+                      if (title.includes("greenlight")) cmd = "greenlight";
+                      core.setOutput("cmd", cmd);
+
+                - name: Arm Kill-Switch (DLX_KILLSWITCH=1)
+                  if: steps.parse.outputs.cmd == 'arm'
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      await github.request('PUT /repos/{owner}/{repo}/actions/variables/{name}', {
+                        owner: context.repo.owner, repo: context.repo.repo, name: 'DLX_KILLSWITCH', value: '1'
+                      });
+
+                - name: Disable Kill-Switch (DLX_KILLSWITCH=0)
+                  if: steps.parse.outputs.cmd == 'greenlight'
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      await github.request('PUT /repos/{owner}/{repo}/actions/variables/{name}', {
+                        owner: context.repo.owner, repo: context.repo.repo, name: 'DLX_KILLSWITCH', value: '0'
+                      });
+
+                - name: Dispatch Agent Inventory
+                  if: steps.parse.outputs.cmd == 'scan'
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        workflow_id: 'agent_inventory.yml',
+                        ref: context.payload.repository.default_branch
+                      });
+          YML
+
+      - name: Commit and open PR for the new workflows
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "feat: bootstrap DLX workflows (self-heal, agent-inventory, issueops)"
+          branch: feature/self-heal-v0_2_0
+          title: "DLX Hands-Off Bootstrap: Inventory + Self-Heal + IssueOps"
+          body: |
+            Bootstraps agent inventory (no GH tokens on VM), Self-Heal (kill-switch aware), and IssueOps controls.
+            - No PATs or `gh auth` required on Kamerta
+            - Uses `GITHUB_TOKEN` exclusively
+          labels: automation,bootstrap
+
+  run_inventory_now:
+    name: Run first inventory (kill-switch safe)
+    needs: setup_repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch Agent Inventory on default branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'agent_inventory.yml',
+              ref: context.payload.repository.default_branch
+            });

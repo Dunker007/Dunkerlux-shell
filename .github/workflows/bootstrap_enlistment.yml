@@ -1,4 +1,4 @@
-name: DLX Bootstrap Enlistment v0.2.0
+name: DLX Bootstrap Enlistment v0.2.0 (v2)
 
 on:
   workflow_dispatch:
@@ -6,73 +6,113 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # ensure gh CLI can auth
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare Enlistment Pack
+      - name: Ensure gh CLI is available
         run: |
-          mkdir -p dlx_enlistment_pack_v0_2_0
-          cd dlx_enlistment_pack_v0_2_0
-          # Reconstruct core files (compressed in base64 for portability)
-          echo "UEsDB..." | base64 --decode > dlx_agents_enlistment_pack_v0_2_0.zip
-          unzip dlx_agents_enlistment_pack_v0_2_0.zip
-          cp -r * ../
-          cd ..
+          if ! command -v gh >/dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+          fi
+          gh --version
 
-      - name: Commit and Push
+      - name: Download Enlistment Pack
         run: |
-          git config user.name "github-actions[bot]"
+          set -euo pipefail
+          mkdir -p /tmp/dlx && cd /tmp/dlx
+          curl -fsSL "https://us-prod.asyncgw.teams.microsoft.com/v1/objects/0-cus-d17-8ba2b9eb004cdd91eebe2f6e2cbebdd8/views/original/dlx_agents_enlistment_pack_v0_2_0.zip" -o pack.zip
+          unzip -o pack.zip
+          rsync -a ./ "$GITHUB_WORKSPACE"/
+
+      - name: Create PR body with rollout checklist
+        run: |
+          cat > /tmp/PR_BODY.md << 'EOF'
+          # DLX Agent Enlistment v0.2.0 + Turbo DV Mode
+
+          This PR introduces the DLX agent pack (v0.2.0), Self-Heal/Release/Nightly workflows,
+          Always-On Write heartbeats, kill-switch compliance, and Turbo DV mode activation.
+
+          ## 🧪 Rollout Checklist
+          - [ ] `DLX_AUTOMATION_MODE=FULL`, `DLX_KILLSWITCH=0` set in repo variables
+          - [ ] Kamerta GitHub Actions runner online and authenticated
+          - [ ] Azure Key Vault secrets available: `DV_URL`, `DV_TOKEN`, `ONEDRIVE_BRIDGE_KEY`
+          - [ ] Dataverse heartbeat table schema updated with new fields
+
+          ### 🚀 Enlistment Pack Contents
+          - [x] `agents/catalog.json` with 12 new agents
+          - [x] `scripts/agents/*.py` with heartbeat + kill-switch logic
+          - [x] `self_heal.yml`, `release_orchestrator.yml`, `nightly_ops.yml` workflows
+          - [x] `repo_health.yml` for YAML/JSON lint
+          - [x] `docs/test_scenario.md` for restartable validation
+          - [x] `ops/console/index.html` for Ops Console badges
+
+          ### 🧪 Testing
+          - [ ] Dispatch `self_heal.yml` with `mode=DRYRUN` and confirm 12 heartbeats
+          - [ ] Dispatch `self_heal.yml` with `mode=FULL` and confirm agent execution
+          - [ ] Dispatch `nightly_ops.yml` manually and confirm secrets/cost/disk checks
+          - [ ] Dispatch `release_orchestrator.yml` with `target_env=TEST` for dry-run
+
+          ### 🛡️ Safety
+          - [x] All agents honor `DLX_KILLSWITCH`
+          - [x] All agents emit Always-On Write heartbeat
+          - [x] No secrets committed; runtime injection only
+          - [x] Idempotent and safe to re-run
+
+          ### 🏁 Finalize
+          - [ ] Merge PR to `feature/self-heal-v0_2_0`
+          - [ ] Monitor Ops Console badges and DV heartbeat freshness
+          EOF
+
+      - name: Create branch, commit and push
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B feature/self-heal-v0_2_0
           git add .
-          git commit -m "DLX: Agent Enlistment v0.2.0 + Turbo DV Mode"
+          git commit -m "DLX: Agent Enlistment v0.2.0 + Turbo DV Mode (AO-Write, kill-switch, workflows)" || echo "No changes to commit"
           git push origin feature/self-heal-v0_2_0 --force
 
-      - name: Create PR
+      - name: Ensure labels
+        run: |
+          gh label create automation     --color 0366d6 --description "DLX automation" --force || true
+          gh label create turbo-dv-mode  --color 5319e7 --description "Turbo DV mode" --force || true
+          gh label create self-heal      --color 0e8a16 --description "Self-Heal workflows" --force || true
+
+      - name: Open or update PR
+        id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           base: main
           branch: feature/self-heal-v0_2_0
           title: "DLX Agent Enlistment v0.2.0 + Turbo DV Mode"
-          body: |
-            # DLX Agent Enlistment v0.2.0 + Turbo DV Mode
-
-            This PR introduces:
-            - 12 new symmetric agents
-            - Self-Heal, Release Orchestrator, Nightly Ops workflows
-            - Always-On Write + Kill-Switch compliance
-            - Turbo DV mode activation
-
-            ## Rollout Checklist
-            - [ ] Set DLX_AUTOMATION_MODE=FULL, DLX_KILLSWITCH=0
-            - [ ] Kamerta runner online
-            - [ ] Key Vault secrets ready
-            - [ ] Dispatch Self-Heal (DRYRUN → FULL)
-            - [ ] Dispatch Nightly Ops
-            - [ ] Dispatch Release Orchestrator (TEST dry-run)
-
+          body-path: /tmp/PR_BODY.md
           labels: |
             automation
             turbo-dv-mode
             self-heal
 
-      - name: Dispatch Self-Heal
+      - name: Set repo variables (Turbo DV on)
+        run: |
+          gh variable set DLX_KEYVAULT_NAME -b "kv-dlx-crypto"
+          gh variable set DLX_KILLSWITCH   -b "0"
+          gh variable set TURBO_DV         -b "1"
+
+      - name: Dispatch Self-Heal (FULL)
         run: gh workflow run "DLX Self-Heal Pack" -f mode=FULL
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Dispatch Nightly Ops
+      - name: Dispatch Nightly Ops (now)
         run: gh workflow run "Nightly Ops"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Dispatch Release Orchestrator
+      - name: Dispatch Release Orchestrator (TEST dry-run)
         run: gh workflow run "Release Orchestrator" -f target_env=TEST -f dry_run=true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

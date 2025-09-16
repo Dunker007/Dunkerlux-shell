@@ -1,0 +1,14 @@
+name: Seed Feature Branch
+on: workflow_dispatch
+permissions: { contents: write }
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -e
+          BRANCH="feature/self-heal-v0_2_0"
+          git checkout -b "$BRANCH"
+          git commit --allow-empty -m "chore(ops): seed feature branch [skip ci]"
+          git push origin HEAD:"$BRANCH"

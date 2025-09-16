@@ -1,0 +1,366 @@
+name: DLX Bootstrap (Apex Studio)
+on:
+  workflow_dispatch:
+
+# Always-On Write — owner mode
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  pages: write
+  id-token: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      # 1) Safe-by-default: DLX_KILLSWITCH=1
+      - name: Ensure DLX_KILLSWITCH=1 (repo variable)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            async function upsertVar(name, value){
+              try {
+                await github.request('PATCH /repos/{owner}/{repo}/actions/variables/{name}', {owner, repo, name, value});
+              } catch (e) {
+                if (e.status === 404) {
+                  await github.request('POST /repos/{owner}/{repo}/actions/variables', {owner, repo, name, value});
+                } else { throw e; }
+              }
+            }
+            await upsertVar('DLX_KILLSWITCH','1');
+
+      # 2) Core DLX workflows (Self-Heal, Inventory, IssueOps)
+      - name: Write core workflows
+        run: |
+          mkdir -p .github/workflows scripts/self_heal docs/assets
+
+          # --- Self-Heal (observe-only while kill-switch=1) ---
+          cat > .github/workflows/self_heal.yml <<'YML'
+          name: DLX Self-Heal
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: "*/15 * * * *"
+          permissions:
+            contents: write
+            actions: write
+          env:
+            DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '1' }}
+          jobs:
+            sentinel:
+              runs-on: self-hosted
+              steps:
+                - uses: actions/checkout@v4
+                - name: Honor kill-switch
+                  if: env.DLX_KILLSWITCH == '1'
+                  run: echo "Kill-switch ON: observe-only mode."
+                - name: Heartbeat (bridge file)
+                  shell: pwsh
+                  run: |
+                    $ts = Get-Date -Format "s"
+                    New-Item -ItemType Directory -Force -Path C:\DLX\OneDriveBridge | Out-Null
+                    Set-Content -Path C:\DLX\OneDriveBridge\LAST_HEARTBEAT.txt -Value "$env:COMPUTERNAME,OK,$ts,0,self-heal"
+          YML
+
+          # --- Agent Inventory (minimal, metadata-only) ---
+          cat > .github/workflows/agent_inventory.yml <<'YML'
+          name: Agent Inventory
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: "13 7 * * 1"
+          permissions:
+            contents: write
+            actions: read
+          env:
+            DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '1' }}
+          jobs:
+            harvest:
+              runs-on: self-hosted
+              steps:
+                - uses: actions/checkout@v4
+                - name: Kamerta Harvest (minimal)
+                  shell: pwsh
+                  run: |
+                    $OutDir = "C:\DLX\Inventory"
+                    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+                    $inv = [ordered]@{
+                      host=$env:COMPUTERNAME; ts=(Get-Date).ToString("s");
+                      killSwitch=[Environment]::GetEnvironmentVariable("DLX_KILLSWITCH","Machine")
+                    }
+                    $inv | ConvertTo-Json | Out-File "$OutDir\kamerta_inventory.json"
+                - name: Upload artifact
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: dlx-agent-inventory
+                    path: C:\DLX\Inventory\*
+          YML
+
+          # --- IssueOps (arm it / greenlight / scan) ---
+          cat > .github/workflows/issueops.yml <<'YML'
+          name: IssueOps Control
+          on:
+            issues:
+              types: [opened, edited]
+          permissions:
+            contents: write
+            actions: write
+          jobs:
+            route:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const {owner, repo} = context.repo;
+                      const title = (context.payload.issue.title || "").toLowerCase();
+                      async function upsertVar(name, value){
+                        try {
+                          await github.request('PATCH /repos/{owner}/{repo}/actions/variables/{name}', {owner, repo, name, value});
+                        } catch (e) {
+                          if (e.status === 404) {
+                            await github.request('POST /repos/{owner}/{repo}/actions/variables', {owner, repo, name, value});
+                          } else { throw e; }
+                        }
+                      }
+                      if (title.includes("greenlight")) { await upsertVar('DLX_KILLSWITCH', '0'); }
+                      if (title.includes("arm it"))     { await upsertVar('DLX_KILLSWITCH', '1'); }
+                      if (title.includes("scan")) {
+                        await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
+                          owner, repo, workflow_id: 'agent_inventory.yml',
+                          ref: context.payload.repository.default_branch
+                        });
+                      }
+          YML
+
+      # 3) Studio delivery: Pages + Backend (status.json)
+      - name: Write Studio workflows
+        run: |
+          # --- Pages deployment (docs/ as site) ---
+          cat > .github/workflows/studio_pages.yml <<'YML'
+          name: Studio Pages
+          on:
+            push:
+              branches: [ ${{ github.event.repository.default_branch }} ]
+              paths:
+                - 'docs/**'
+            workflow_dispatch:
+          permissions:
+            contents: read
+            pages: write
+            id-token: write
+          concurrency:
+            group: "pages"
+            cancel-in-progress: true
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/upload-pages-artifact@v3
+                  with:
+                    path: ./docs
+            deploy:
+              needs: build
+              runs-on: ubuntu-latest
+              environment:
+                name: github-pages
+                url: ${{ steps.deployment.outputs.page_url }}
+              steps:
+                - id: deployment
+                  uses: actions/deploy-pages@v4
+          YML
+
+          # --- Backend: create docs/status.json regularly and on runs ---
+          cat > .github/workflows/studio_backend.yml <<'YML'
+          name: Studio Backend (status.json)
+          on:
+            schedule:
+              - cron: "*/10 * * * *"
+            workflow_dispatch:
+            workflow_run:
+              workflows: [ "DLX Self-Heal", "Agent Inventory" ]
+              types: [ completed ]
+          permissions:
+            contents: write
+            actions: read
+          jobs:
+            build_status:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - name: Build status.json
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const {owner, repo} = context.repo;
+                      function pick(r){
+                        return {
+                          name: r.name || r.display_title || r.head_branch,
+                          event: r.event,
+                          status: r.status,
+                          conclusion: r.conclusion,
+                          run_started_at: r.run_started_at,
+                          updated_at: r.updated_at,
+                          html_url: r.html_url
+                        };
+                      }
+                      const runs1 = await github.request('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs', {owner, repo, workflow_id: 'self_heal.yml', per_page: 5});
+                      const runs2 = await github.request('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs', {owner, repo, workflow_id: 'agent_inventory.yml', per_page: 5});
+                      const out = {
+                        generatedAt: new Date().toISOString(),
+                        self_heal: (runs1.data.workflow_runs||[]).map(pick),
+                        agent_inventory: (runs2.data.workflow_runs||[]).map(pick),
+                        killswitch: process.env['DLX_KILLSWITCH'] || '1'
+                      };
+                      const fs = require('fs'); fs.mkdirSync('docs', { recursive: true });
+                      fs.writeFileSync('docs/status.json', JSON.stringify(out, null, 2));
+                - name: Commit status.json (branch-safe)
+                  run: |
+                    git config user.name "DLX Bot"
+                    git config user.email "dlx-bot@users.noreply.github.com"
+                    git add docs/status.json
+                    git commit -m "chore(studio): update status.json" || echo "No changes"
+                    git push origin HEAD
+          YML
+
+      # 4) Studio front-end at apex domain (docs/)
+      - name: Write Studio front-end (docs/)
+        run: |
+          # Apex CNAME
+          cat > docs/CNAME <<'TXT'
+          dlxstudios.ai
+          TXT
+
+          # Minimal, fast Studio UI
+          cat > docs/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>DLX Design Automation Studio</title>
+            <link rel="stylesheet" href="assets/styles.css"/>
+          </head>
+          <body>
+            <header>
+              <h1>DLX Design Automation Studio</h1>
+              <div id="status-dot" class="dot dot-unknown" title="Loading..."></div>
+            </header>
+
+            <section class="controls">
+              https://github.com/${GITHUB_REPOSITORY}/issues/new?title=arm%20it
+              https://github.com/${GITHUB_REPOSITORY}/issues/new?title=greenlight
+              <a class="thub.com/${GITHUB_REPOSITORY}/issues/new?title=scan
+              https://github.com/${GITHUB_REPOSITORY}/actions/workflows/self_heal.yml
+              <a class="btn" target="_blank" href="Y}/actions/workflows/agent_inventory.yml
+            </section>
+
+            <section>
+              <h2>Live Status</h2>
+              <pre id="status">Loading...</pre>
+            </section>
+
+            <footer>
+              <small>© DLX Studios — Owner Mode • Always‑On Write</small>
+            </footer>
+
+            <script>window.REPO='${GITHUB_REPOSITORY}';</script>
+            <script src="assets/app.js"></script>
+          </body>
+          </html>
+          HTML
+          cat > docs/assets/styles.css <<'CSS'
+          :root { --bg:#0c0e12; --fg:#e8eef9; --muted:#98a2b3; --accent:#5b9cff; --ok:#16a34a; --warn:#f59e0b; --err:#ef4444; }
+          * { box-sizing: border-box; }
+          body { margin:0; font:16px/1.4 system-ui,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--fg); }
+          header { display:flex; align-items:center; gap:10px; padding:18px 20px; border-bottom:1px solid #1f2937; }
+          h1 { font-size:20px; margin:0; }
+          .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+          .dot-unknown { background:#64748b; }
+          .dot-ok { background:var(--ok); }
+          .dot-warn { background:var(--warn); }
+          .dot-err { background:var(--err); }
+          .controls { display:flex; flex-wrap:wrap; gap:8px; padding:16px 20px; border-bottom:1px solid #1f2937; }
+          .btn { background:#111827; padding:10px 12px; border:1px solid #243042; color:var(--fg); text-decoration:none; border-radius:8px; }
+          .btn:hover { border-color:var(--accent); }
+          section { padding:16px 20px; }
+          pre { background:#0b1220; border:1px solid #182235; padding:12px; border-radius:8px; overflow:auto; }
+          footer { padding:16px 20px; border-top:1px solid #1f2937; color:var(--muted); }
+          CSS
+          cat > docs/assets/app.js <<'JS'
+          async function load() {
+            const res = await fetch('status.json', {cache: 'no-store'}).catch(()=>null);
+            const el = document.getElementById('status');
+            const dot = document.getElementById('status-dot');
+            if (!res || !res.ok) { el.textContent = 'No status yet. Wait for backend to publish status.json.'; return; }
+            const data = await res.json();
+            el.textContent = JSON.stringify(data, null, 2);
+            const k = data.killswitch === '0' ? 'ok' : 'warn';
+            dot.className = 'dot dot-' + k;
+            dot.title = data.killswitch === '0' ? 'FULL mode' : 'Paused (Kill-Switch ON)';
+          }
+          load();
+          JS
+      # 5) PR + best-effort auto-merge (merges when checks pass if repo allows)
+      - name: Open PR
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "feat: DLX core + Studio (Pages, backend, IssueOps) [apex]"
+          branch: feature/studio-apex
+          title: "DLX Bootstrap: Core workflows + Studio (Apex domain)"
+          body: |
+            - Always-On Write permissions (owner mode)
+            - DLX Self-Heal (observe-only), Agent Inventory, IssueOps
+            - Studio Pages (docs/) with apex CNAME: dlxstudios.ai
+            - Studio Backend (status.json) for live status
+          labels: automation,bootstrap,studio
+          draft: false
+
+      - name: Enable auto-merge (if allowed) and set to squash
+        if: steps.cpr.outputs.pull-request-number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const prNumber = Number('${{ steps.cpr.outputs.pull-request-number }}');
+            // Get PR node_id for GraphQL
+            const pr = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {owner, repo, pull_number: prNumber});
+            const prId = pr.data.node_id;
+            const query = `
+              mutation($prId:ID!){
+                enablePullRequestAutoMerge(input:{pullRequestId:$prId, mergeMethod:SQUASH}) {
+                  pullRequest { number }
+                }
+              }`;
+            try {
+              await github.graphql(query, { prId });
+            } catch (e) {
+              core.warning('Auto-merge not enabled in repo or insufficient perms. PR left open.');
+            }
+
+  # Seed status on the PR branch so the Studio has content on merge
+  seed_status:
+    needs: bootstrap
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Dispatch Studio Backend on PR branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'studio_backend.yml',
+              ref: 'feature/studio-apex'
+            });

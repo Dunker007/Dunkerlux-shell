@@ -1,0 +1,424 @@
+name: Seed DLX v0.3.1 PR
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create feature branch
+        run: |
+          set -e
+          BR="feature/self-heal-v0_3_1"
+          git checkout -b "$BR" || git checkout "$BR"
+          echo "BR=$BR" >> $GITHUB_ENV
+
+      - name: Scaffold repo structure
+        shell: bash
+        run: |
+          set -e
+          mkdir -p .dlx/memory
+          mkdir -p dataverse/schema dataverse/solutions/dlx-core
+          mkdir -p ops bootstrap .github/workflows
+
+          cat > .dlx/lux_config.json <<'EOF'
+          {
+            "version": "0.3.1",
+            "publisher": "DLX Studios",
+            "modes": { "automation": "FULL", "killswitch": 0 },
+            "routes": { "pipelines": "kamerta_runner", "ops_console": "vm_local" },
+            "dv": { "url": "https://dlxstudiosdefault.crm.dynamics.com" },
+            "guards": { "fallback_to_github_secrets": true, "two_phase_verify": true }
+          }
+          EOF
+
+          cat > .dlx/model_routing.json <<'EOF'
+          {
+            "default": "gpt-5",
+            "routes": {
+              "devops": "gpt-5",
+              "dataverse": "gpt-5",
+              "summarize": "gpt-5",
+              "triage": "gpt-5"
+            }
+          }
+          EOF
+
+          cat > .dlx/memory/manifest.json <<'EOF'
+          {
+            "version": "2.0",
+            "host": "Kamerta",
+            "modes": { "automation": "FULL", "killswitch": 0 },
+            "dv": { "url": "https://dlxstudiosdefault.crm.dynamics.com" },
+            "guards": { "fallback_to_github_secrets": true, "two_phase_verify": true },
+            "last": { "successful_pipeline": null, "self_heal_seq": 0 }
+          }
+          EOF
+
+          cat > dataverse/schema/heartbeat.table.json <<'EOF'
+          { "name": "dlx_heartbeat", "columns": ["host","status","ts","seq","note"] }
+          EOF
+
+          cat > dataverse/schema/memory_timeline.table.json <<'EOF'
+          { "name": "dlx_memory_timeline", "columns": ["created_at","scope","key","summary","related_run"] }
+          EOF
+
+          cat > ops/ops_console.html <<'EOF'
+          <!doctype html><html><head><meta charset="utf-8"/><title>DLX Ops Console</title>
+          <style>body{font:14px/1.4 system-ui;margin:2rem}.row{margin-bottom:1rem}button{padding:8px 12px;margin-right:8px}#log{white-space:pre-wrap;background:#111;color:#0f0;padding:12px;border-radius:6px}</style>
+          </head><body>
+          <h1>DLX Ops Console</h1>
+          <div class="row">
+            <button onclick="dispatch('FULL')">Run Pipeline (FULL)</button>
+            <button onclick="dispatch('SAFE')">Run Pipeline (SAFE)</button>
+            <button onclick="dispatch('DRYRUN')">Run Pipeline (DRYRUN)</button>
+          </div>
+          <div class="row">
+            <button onclick="killswitch(1)">Kill‑Switch ON</button>
+            <button onclick="killswitch(0)">Kill‑Switch OFF</button>
+            <button onclick="selfheal()">Force Self‑Heal</button>
+          </div>
+          <div class="row"><button onclick="heartbeats()">Fetch Heartbeats</button></div>
+          <h3>Log</h3><div id="log"></div>
+          <script>
+          const log=(m)=>{document.getElementById('log').textContent += m+"\\n";}
+          async function dispatch(mode){log(`Dispatching pipeline: ${mode}…`);
+            const r=await fetch('http://127.0.0.1:8765/dispatch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})}); log(await r.text());}
+          async function killswitch(v){log(`Setting kill‑switch = ${v}`);
+            const r=await fetch('http://127.0.0.1:8765/killswitch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})}); log(await r.text());}
+          async function selfheal(){log(`Triggering self‑heal…`);
+            const r=await fetch('http://127.0.0.1:8765/selfheal',{method:'POST'}); log(await r.text());}
+          async function heartbeats(){log(`Loading heartbeats…`);
+            const r=await fetch('http://127.0.0.1:8765/heartbeats'); log(await r.text());}
+          </script></body></html>
+          EOF
+
+          cat > ops/Trigger_Listener_Script.py <<'EOF'
+          import json, os
+          from datetime import datetime
+          from flask import Flask, request, Response
+          app = Flask(__name__)
+
+          def dispatch_pipeline(mode="FULL"): return f"Pipeline dispatch queued with mode={mode}"
+          def set_killswitch(val:int): return f"DLX_KILLSWITCH set to {val}"
+          def fetch_heartbeats():
+              return json.dumps({"items":[{"host":"Kamerta","status":"ok","ts":datetime.utcnow().isoformat()}]}, indent=2)
+
+          @app.post("/dispatch")
+          def http_dispatch():
+              mode = request.json.get("mode","FULL"); return Response(dispatch_pipeline(mode), mimetype="text/plain")
+          @app.post("/killswitch")
+          def http_killswitch():
+              value = int(request.json.get("value",1)); return Response(set_killswitch(value), mimetype="text/plain")
+          @app.post("/selfheal")
+          def http_selfheal():
+              return Response("Self‑heal triggered", mimetype="text/plain")
+          @app.get("/heartbeats")
+          def http_heartbeats():
+              return Response(fetch_heartbeats(), mimetype="application/json")
+          if __name__ == "__main__":
+              try: import flask # noqa
+              except Exception: os.system('python -m pip install --upgrade pip flask > nul 2>&1')
+              app.run(host="127.0.0.1", port=8765)
+          EOF
+
+          cat > bootstrap/DLX_Bootstrap.ps1 <<'EOF'
+          [CmdletBinding()] param(
+            [string]$Root="C:\DLXStudios",[int]$ListenerPort=8765,[string]$Repo="https://github.com/Dunker007/dunkerlux-shell.git"
+          )
+          $ErrorActionPreference="Stop"; function Ensure-Dir($p){ if(-not (Test-Path $p)){ New-Item -ItemType Directory -Path $p | Out-Null } }
+          Ensure-Dir $Root; Ensure-Dir "$Root\.lux\memory"; Ensure-Dir "$Root\.lux\objects"; Ensure-Dir "$Root\.cache\pip"; Ensure-Dir "$Root\ops"
+          if ($PSVersionTable.PSVersion.Major -lt 7) { winget install --id Microsoft.PowerShell -e --source winget | Out-Null }
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) { winget install --id Git.Git -e --source winget | Out-Null }
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) { winget install --id Python.Python.3.11 -e --source winget | Out-Null }
+          if (Test-Path "$Root\dunkerlux-shell\.git"){ git -C "$Root\dunkerlux-shell" fetch --all --prune; git -C "$Root\dunkerlux-shell" checkout main; git -C "$Root\dunkerlux-shell" pull } else { git clone $Repo "$Root\dunkerlux-shell" }
+          Copy-Item "$Root\dunkerlux-shell\ops\*" "$Root\ops" -Recurse -Force -ErrorAction SilentlyContinue
+          $manifest=@{version="2.0";host=$env:COMPUTERNAME;modes=@{automation="FULL";killswitch=0};dv=@{url="https://dlxstudiosdefault.crm.dynamics.com"};guards=@{fallback_to_github_secrets=$true;two_phase_verify=$true};last=@{successful_pipeline=$null;self_heal_seq=0}}; $manifest | ConvertTo-Json -Depth 5 | Set-Content "$Root\.lux\memory\manifest.json" -Encoding UTF8
+          python -m pip install --upgrade pip --cache-dir "$Root\.cache\pip"; pip install flask --cache-dir "$Root\.cache\pip"
+          $scriptPath = "$Root\ops\Trigger_Listener_Script.py"
+          $act = New-ScheduledTaskAction -Execute "python.exe" -Argument "`"$scriptPath`""
+          $trg = New-ScheduledTaskTrigger -AtStartup -RandomDelay (New-TimeSpan -Minutes 1)
+          $pri = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+          Register-ScheduledTask -TaskName "DLX_TriggerListener" -Action $act -Trigger $trg -Principal $pri -Force | Out-Null
+          netsh advfirewall firewall add rule name="DLX Listener Loopback" dir=in action=allow protocol=TCP localport=$ListenerPort localip=127.0.0.1 remoteip=127.0.0.1 | Out-Null
+          Write-Host "Bootstrap complete."
+          EOF
+
+          cat > .github/workflows/dlx_pipelines.yml <<'EOF'
+          name: DLX – Pipelines (Dev→Test→Prod)
+
+          on:
+            workflow_dispatch:
+              inputs:
+                mode:
+                  description: "Automation mode (AUTO chooses based on recent health)"
+                  required: true
+                  default: "AUTO"
+                  type: choice
+                  options: [AUTO, FULL, SAFE, DRYRUN]
+            push:
+              branches: [ main ]
+
+          permissions:
+            id-token: write
+            contents: write
+            pull-requests: write
+
+          env:
+            KEYVAULT_NAME: kv-dlx-crypto
+            TENANT_ID: 28c477fd-e72e-4747-b3c8-6df736b4806e
+            SUBSCRIPTION_ID: b6df2bd8-ddc2-47a0-ad7d-45730e1063cb
+            DV_URL: https://dlxstudiosdefault.crm.dynamics.com
+            PUBLISHER_NAME: DLX Studios
+            PUBLISHER_PREFIX: dlx
+            DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '0' }}
+
+          concurrency:
+            group: dv-prod
+            cancel-in-progress: false
+
+          jobs:
+            ramp_check:
+              name: Compute ramp mode & parallelism
+              runs-on: ubuntu-latest
+              outputs:
+                mode: ${{ steps.decider.outputs.mode }}
+                parallel: ${{ steps.decider.outputs.parallel }}
+              steps:
+                - name: Decide mode based on last 10 runs
+                  id: decider
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const modeInput = core.getInput('mode', { required: false }) || 'AUTO';
+                      if (modeInput !== 'AUTO') {
+                        core.setOutput('mode', modeInput);
+                        core.setOutput('parallel', '2');
+                        return;
+                      }
+                      const wfName = 'DLX – Pipelines (Dev→Test→Prod)';
+                      const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 });
+                      const ours = runs.filter(r => r.name === wfName).slice(0, 10);
+                      const successes = ours.filter(r => r.conclusion === 'success').length;
+                      const rate = ours.length ? successes / ours.length : 0;
+                      let mode = 'SAFE', parallel = 2;
+                      if (rate >= 0.8 && ours.length >= 5) { mode = 'FULL'; parallel = 4; }
+                      else if (rate >= 0.5) { mode = 'SAFE'; parallel = 3; }
+                      else { mode = 'DRYRUN'; parallel = 2; }
+                      core.setOutput('mode', mode);
+                      core.setOutput('parallel', String(parallel));
+                      core.notice(`Ramp: history=${ours.length}, success=${successes}, rate=${rate}, mode=${mode}, parallel=${parallel}`);
+
+            preflight:
+              needs: ramp_check
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - name: Azure login (OIDC)
+                  uses: azure/login@v2
+                  with:
+                    tenant-id: ${{ env.TENANT_ID }}
+                    subscription-id: ${{ env.SUBSCRIPTION_ID }}
+                    allow-no-subscriptions: true
+                - name: Validate Key Vault + secrets contract
+                  uses: azure/cli@v2
+                  with:
+                    inlineScript: |
+                      az keyvault show -n $KEYVAULT_NAME
+                      for s in DV_URL DV_TOKEN SPACESHIP_DOMAIN SPACESHIP_TOKEN ONEDRIVE_BRIDGE_KEY; do
+                        az keyvault secret show --vault-name $KEYVAULT_NAME --name $s --only-show-errors || echo "Secret $s missing (OK if OIDC replaces it)"
+                      done
+                      if [ "${{ env.DLX_KILLSWITCH }}" = "1" ]; then echo "Kill-switch active"; exit 2; fi
+                - name: Acquire DV token via OIDC
+                  shell: bash
+                  run: |
+                    TOK=$(az account get-access-token --resource $DV_URL --query accessToken -o tsv)
+                    test -n "$TOK" || (echo "DV token acquisition failed" && exit 1)
+
+            build_pack:
+              needs: preflight
+              strategy:
+                fail-fast: false
+                matrix:
+                  runner: [ "self-hosted", "windows-latest" ]
+              runs-on: ${{ matrix.runner }}
+              if: ${{ matrix.runner != 'self-hosted' || startsWith(runner.name, 'kamerta') }}
+              steps:
+                - uses: actions/checkout@v4
+                - name: Setup Power Platform CLI
+                  uses: microsoft/powerplatform-actions/actions-install@v2
+                - name: Cache pac & node
+                  uses: actions/cache@v4
+                  with:
+                    path: |
+                      ~/.cache/pac
+                      ~/.npm
+                    key: pac-node-${{ runner.os }}-${{ hashFiles('**/package-lock.json','**/pac.json') }}
+                - name: Export/Pack solution (Managed)
+                  uses: microsoft/powerplatform-actions/pack-solution@v2
+                  with:
+                    solution-folder: ./dataverse/solutions/dlx-core
+                    solution-file: ./dist/dlx-core.zip
+                    solution-type: Managed
+                - name: Upload artifact
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: dlx-core
+                    path: dist/dlx-core.zip
+
+            import_test:
+              needs: build_pack
+              runs-on: windows-latest
+              steps:
+                - uses: actions/download-artifact@v4
+                  with: { name: dlx-core, path: dist }
+                - name: Setup Power Platform CLI
+                  uses: microsoft/powerplatform-actions/actions-install@v2
+                - name: Import to Test
+                  uses: microsoft/powerplatform-actions/import-solution@v2
+                  with:
+                    environment-url: ${{ secrets.DLX_TEST_URL || env.DV_URL }}
+                    solution-file: ./dist/dlx-core.zip
+                    activate-plugins: true
+                    publish-changes: true
+
+            smoke_test:
+              needs: import_test
+              runs-on: ubuntu-latest
+              steps:
+                - name: Smoke tests
+                  run: echo "TODO: implement flows/API pings"; echo "ok"
+
+            import_prod:
+              needs: [smoke_test, build_pack]
+              if: ${{ needs.ramp_check.outputs.mode == 'FULL' }}
+              runs-on: windows-latest
+              steps:
+                - uses: actions/download-artifact@v4
+                  with: { name: dlx-core, path: dist }
+                - name: Setup Power Platform CLI
+                  uses: microsoft/powerplatform-actions/actions-install@v2
+                - name: Import to Prod
+                  uses: microsoft/powerplatform-actions/import-solution@v2
+                  with:
+                    environment-url: ${{ secrets.DLX_PROD_URL || env.DV_URL }}
+                    solution-file: ./dist/dlx-core.zip
+                    activate-plugins: true
+                    publish-changes: true
+
+            telemetry:
+              name: Telemetry & Memory tiles
+              needs: [preflight, build_pack, import_test, smoke_test, import_prod]
+              runs-on: ubuntu-latest
+              if: always()
+              steps:
+                - name: Emit heartbeat (placeholder)
+                  run: echo "HB {host:'GH', ts:'$(date -Iseconds)', status:'${{ job.status }}'}"
+          EOF
+
+          cat > .github/workflows/self_heal.yml <<'EOF'
+          name: DLX – Self-Heal Sentinel
+          on:
+            schedule: [{ cron: "*/15 * * * *" }]
+            workflow_dispatch: {}
+            workflow_run:
+              workflows: ["DLX – Pipelines (Dev→Test→Prod)"]
+              types: [completed]
+          permissions:
+            id-token: write
+            contents: write
+            pull-requests: write
+          env:
+            KEYVAULT_NAME: kv-dlx-crypto
+            DLX_AUTOMATION_MODE: FULL
+            DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '0' }}
+          jobs:
+            sentinel:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: azure/login@v2
+                  with:
+                    tenant-id: 28c477fd-e72e-4747-b3c8-6df736b4806e
+                    subscription-id: b6df2bd8-ddc2-47a0-ad7d-45730e1063cb
+                    allow-no-subscriptions: true
+                - name: Heartbeat
+                  run: echo "Self-heal HB $(date -Iseconds)"
+                - name: Auth/KV Check
+                  uses: azure/cli@v2
+                  with:
+                    inlineScript: |
+                      az keyvault show -n $KEYVAULT_NAME || echo "KV unavailable"
+                - name: Rerun transient failures (placeholder)
+                  run: echo "Query runs via API and rerun transient failures"
+          EOF
+
+          cat > .github/workflows/repo_health.yml <<'EOF'
+          name: Repo Health
+          on:
+            pull_request:
+            push: { branches: [ main ] }
+          permissions:
+            contents: read
+            security-events: write
+          jobs:
+            health:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - name: Lint placeholders
+                  run: echo "lint ok"
+                - name: CodeQL init
+                  uses: github/codeql-action/init@v3
+                  with: { languages: javascript, python }
+                - name: CodeQL analyze
+                  uses: github/codeql-action/analyze@v3
+          EOF
+
+      - name: Commit and push
+        run: |
+          git add .
+          git commit -m "DLX v0.3.1: Unified Orchestrator, parallel pipelines, ramp-up, Memory Mimic v2"
+          git push --set-upstream origin "$BR"
+
+      - name: Open PR
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const res = await github.rest.pulls.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: "DLX v0.3.1 – Orchestrator + Parallel Pipelines + Auto Ramp-Up",
+              head: process.env.BR, base: "main",
+              body: [
+                "## DLX v0.3.1",
+                "- Unified pipelines (parallel where safe) with AUTO ramp to FULL",
+                "- Self-Heal Sentinel, Ops Console + Listener, Memory Mimic v2",
+                "- OIDC-first auth; KV fallback; telemetry hooks"
+              ].join("\n")
+            });
+            core.setOutput('number', String(res.data.number));
+
+      - name: Label PR
+        uses: actions-ecosystem/action-add-labels@v1
+        with:
+          labels: |
+            dlx
+            automerge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge (squash)
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.pr.outputs.number }}

@@ -1,0 +1,78 @@
+name: DLX Bootstrap Enlistment v0.2.0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare Enlistment Pack
+        run: |
+          mkdir -p dlx_enlistment_pack_v0_2_0
+          cd dlx_enlistment_pack_v0_2_0
+          # Reconstruct core files (compressed in base64 for portability)
+          echo "UEsDB..." | base64 --decode > dlx_agents_enlistment_pack_v0_2_0.zip
+          unzip dlx_agents_enlistment_pack_v0_2_0.zip
+          cp -r * ../
+          cd ..
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B feature/self-heal-v0_2_0
+          git add .
+          git commit -m "DLX: Agent Enlistment v0.2.0 + Turbo DV Mode"
+          git push origin feature/self-heal-v0_2_0 --force
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: feature/self-heal-v0_2_0
+          title: "DLX Agent Enlistment v0.2.0 + Turbo DV Mode"
+          body: |
+            # DLX Agent Enlistment v0.2.0 + Turbo DV Mode
+
+            This PR introduces:
+            - 12 new symmetric agents
+            - Self-Heal, Release Orchestrator, Nightly Ops workflows
+            - Always-On Write + Kill-Switch compliance
+            - Turbo DV mode activation
+
+            ## Rollout Checklist
+            - [ ] Set DLX_AUTOMATION_MODE=FULL, DLX_KILLSWITCH=0
+            - [ ] Kamerta runner online
+            - [ ] Key Vault secrets ready
+            - [ ] Dispatch Self-Heal (DRYRUN → FULL)
+            - [ ] Dispatch Nightly Ops
+            - [ ] Dispatch Release Orchestrator (TEST dry-run)
+
+          labels: |
+            automation
+            turbo-dv-mode
+            self-heal
+
+      - name: Dispatch Self-Heal
+        run: gh workflow run "DLX Self-Heal Pack" -f mode=FULL
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dispatch Nightly Ops
+        run: gh workflow run "Nightly Ops"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dispatch Release Orchestrator
+        run: gh workflow run "Release Orchestrator" -f target_env=TEST -f dry_run=true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

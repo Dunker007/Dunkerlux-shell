@@ -1,0 +1,682 @@
+name: Stage DLX Ops PR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  stage_pr:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: feature/self-heal-v0_2_0
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name "dlx-ops"
+          git config user.email "ops@dlx.local"
+
+      - name: Create feature branch
+        run: |
+          git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" || true
+          git checkout -B "${BRANCH}" origin/${BRANCH} || git checkout -b "${BRANCH}"
+
+      - name: Write files — workflows
+        shell: bash
+        run: |
+          mkdir -p .github/workflows
+          cat <<'YML' > .github/workflows/self_heal.yml
+          name: DLX Self-Heal
+
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: "*/15 * * * *"
+            workflow_run:
+              workflows: ["Repo Health"]
+              types: [completed]
+
+          permissions:
+            contents: write
+            issues: write
+            id-token: write
+          concurrency:
+            group: dlx-self-heal
+            cancel-in-progress: false
+
+          jobs:
+            self_heal:
+              runs-on: [self-hosted, windows, kamerta]
+              env:
+                DLX_AUTOMATION_MODE: ${{ vars.DLX_AUTOMATION_MODE || 'FULL' }}
+                DLX_KILLSWITCH: ${{ vars.DLX_KILLSWITCH || '0' }}
+                KV_NAME: kv-dlx-crypto
+                HOSTNAME: Kamerta
+              steps:
+                - name: Preflight – Killswitch Gate
+                  if: env.DLX_KILLSWITCH == '1'
+                  run: |
+                    echo "DLX_KILLSWITCH=1 → Skipping by policy."
+                    echo "status=SKIPPED" >> $env:GITHUB_OUTPUT
+                  shell: pwsh
+
+                - name: Checkout
+                  if: env.DLX_KILLSWITCH != '1'
+                  uses: actions/checkout@v4
+
+                - name: Azure Login (OIDC)
+                  if: env.DLX_KILLSWITCH != '1'
+                  uses: azure/login@v2
+                  with:
+                    client-id: ${{ vars.AZURE_CLIENT_ID }}
+                    tenant-id: ${{ vars.AZURE_TENANT_ID }}
+                    subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+                - name: Ensure Azure CLI (install if missing)
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: |
+                    $ErrorActionPreference = "Continue"
+                    az -v *> $null
+                    if ($LASTEXITCODE -ne 0) {
+                      Write-Host "Installing Azure CLI via MSI..."
+                      $ProgressPreference = "SilentlyContinue"
+                      Invoke-WebRequest -Uri https://aka.ms/installazurecliwindows -OutFile azcli.msi
+                      Start-Process msiexec.exe -Wait -ArgumentList '/I azcli.msi /quiet /qn /norestart'
+                      Remove-Item azcli.msi -Force
+                    }
+
+                - name: Pull Secrets from Key Vault (fallback to GH secrets)
+                  if: env.DLX_KILLSWITCH != '1'
+                  id: kv
+                  env:
+                    GH_DV_URL: ${{ secrets.DV_URL }}
+                    GH_DV_TOKEN: ${{ secrets.DV_TOKEN }}
+                  shell: pwsh
+                  run: |
+                    $ErrorActionPreference = "SilentlyContinue"
+                    $dvUrl = az keyvault secret show --vault-name $env:KV_NAME --name "DV-URL" --query value -o tsv
+                    $dvToken = az keyvault secret show --vault-name $env:KV_NAME --name "DV-TOKEN" --query value -o tsv
+
+                    if ([string]::IsNullOrWhiteSpace($dvUrl)) { $dvUrl = $env:GH_DV_URL }
+                    if ([string]::IsNullOrWhiteSpace($dvToken)) { $dvToken = $env:GH_DV_TOKEN }
+
+                    if ([string]::IsNullOrWhiteSpace($dvUrl) -or [string]::IsNullOrWhiteSpace($dvToken)) {
+                      Write-Error "Missing Dataverse credentials (KV and GH fallback not available)."
+                      exit 1
+                    }
+
+                    "DV_URL=$dvUrl"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                    "DV_TOKEN=$dvToken" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                    Write-Host "DV secrets resolved."
+
+                - name: Python – ensure available
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: |
+                    py --version 2>$null || python --version 2>$null || (Write-Host "Installing Python is authorized but not handled here.")
+
+                - name: Manifest Check
+                  if: env.DLX_KILLSWITCH != '1'
+                  shell: pwsh
+                  run: |
+                    python scripts/manifest_check.py --manifest Lux_Boot_Manifest.v2.json --schema scripts/Lux_Boot_Manifest.schema.v2.json
+
+                - name: Heartbeat → Dataverse
+                  if: env.DLX_KILLSWITCH != '1'
+                  env:
+                    DV_URL: ${{ env.DV_URL }}
+                    DV_TOKEN: ${{ env.DV_TOKEN }}
+                    NOTE: "self_heal.yml"
+                  shell: pwsh
+                  run: |
+                    python scripts/heartbeat_post.py --host $env:HOSTNAME --status "OK" --note $env:NOTE
+                - name: Publish Status JSON (Always-On Write)
+                  if: always()
+                  shell: pwsh
+                  run: |
+                    $now = [DateTime]::UtcNow.ToString("o")
+                    $payload = @{
+                      host       = "${{ env.HOSTNAME }}"
+                      mode       = "${{ env.DLX_AUTOMATION_MODE }}"
+                      killswitch = "${{ env.DLX_KILLSWITCH }}"
+                      lastRunUtc = $now
+                      workflow   = "self_heal.yml"
+                      status     = "${{ job.status }}"
+                    } | ConvertTo-Json -Depth 3
+                    $outDir = "docs/status"
+                    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+                    $payload | Out-File -FilePath "$outDir/self_heal.json" -Encoding utf8
+                - name: Commit status.json
+                  if: always()
+                  uses: stefanzweifel/git-auto-commit-action@v5
+                  with:
+                    commit_message: "chore(ops): update self_heal status [skip ci]"
+                    file_pattern: docs/status/self_heal.json
+
+                - name: Tripwires & Alerts
+                  if: failure()
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const title = "Self-Heal Failure Tripwire";
+                      const body  = `Run: ${context.runNumber}\nWorkflow: self_heal.yml\nMode: ${process.env.DLX_AUTOMATION_MODE}\nHost: ${process.env.HOSTNAME}\nAction: actions_rerun once`;
+                      await github.rest.issues.create({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        title, body, labels: ["ops", "self-heal", "critical"]
+                      })
+          YML
+
+          cat <<'YML' > .github/workflows/repo_health.yml
+          name: Repo Health
+
+          on:
+            schedule:
+              - cron: "*/10 * * * *"
+            workflow_dispatch:
+
+          permissions:
+            contents: write
+
+          jobs:
+            health:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Gather Runner & Workflow Health
+                  id: gather
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const {owner, repo} = context.repo;
+                      const runners = await github.rest.actions.listSelfHostedRunnersForRepo({owner, repo, per_page: 100});
+                      const runs = await github.rest.actions.listWorkflowRunsForRepo({owner, repo, per_page: 10});
+                      const kamerta = runners.data.runners.find(r => (r.labels || []).some(l => l.name.toLowerCase() === 'kamerta'));
+                      const payload = {
+                        updatedUtc: new Date().toISOString(),
+                        runners: {
+                          total: runners.data.total_count,
+                          kamerta: kamerta ? { name: kamerta.name, status: kamerta.status, busy: kamerta.busy } : null
+                        },
+                        recentRuns: (runs.data.workflow_runs || []).map(r => ({
+                          name: r.name, id: r.id, attempt: r.run_attempt, status: r.status, conclusion: r.conclusion, created_at: r.created_at
+                        }))
+                      };
+                      core.setOutput('json', JSON.stringify(payload));
+
+                - name: Write repo_health.json
+                  run: |
+                    mkdir -p docs/status
+                    echo '${{ steps.gather.outputs.json }}' > docs/status/repo_health.json
+
+                - name: Commit repo_health.json
+                  uses: stefanzweifel/git-auto-commit-action@v5
+                  with:
+                    commit_message: "chore(ops): update repo health [skip ci]"
+                    file_pattern: docs/status/repo_health.json
+          YML
+
+          cat <<'YML' > .github/workflows/test_scenario.yml
+          name: Test Scenario
+
+          on:
+            workflow_dispatch:
+
+          permissions:
+            contents: write
+            pull-requests: write
+
+          jobs:
+            mock_pr_and_trigger:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Create ephemeral branch & stub change
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const branch = `ops/test-${Date.now()}`;
+                      const base   = "feature/self-heal-v0_2_0";
+                      const {owner, repo} = context.repo;
+                      // 1) get base ref
+                      const baseRef = await github.rest.git.getRef({owner, repo, ref: `heads/${base}`});
+                      // 2) create new ref
+                      await github.rest.git.createRef({owner, repo, ref: `refs/heads/${branch}`, sha: baseRef.data.object.sha});
+                      // 3) add stub file
+                      const path = "docs/status/_probe.txt";
+                      const content = Buffer.from(`probe ${new Date().toISOString()}`).toString('base64');
+                      await github.rest.repos.createOrUpdateFileContents({
+                        owner, repo, path, message: "chore(test): probe file", content, branch
+                      });
+                      // 4) open PR
+                      const pr = await github.rest.pulls.create({owner, repo, head: branch, base, title: "Test: Self-Heal Validation"});
+                      core.setOutput("branch", branch);
+                      core.setOutput("pr", pr.data.number.toString());
+
+                - name: Dispatch self_heal.yml
+                  uses: actions/github-script@v7
+                  with:
+                    script: |
+                      const {owner, repo} = context.repo;
+                      await github.rest.actions.createWorkflowDispatch({
+                        owner, repo,
+                        workflow_id: "self_heal.yml",
+                        ref: "feature/self-heal-v0_2_0",
+                        inputs: {}
+                      });
+          YML
+
+      - name: Write files — scripts
+        shell: bash
+        run: |
+          mkdir -p scripts
+          cat <<'JSON' > scripts/Lux_Boot_Manifest.schema.v2.json
+          {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "Lux Boot Manifest v2",
+            "type": "object",
+            "required": ["version", "vm", "repo", "runner", "sentinel", "keyVault"],
+            "properties": {
+              "version": { "type": "string", "pattern": "^2\\." },
+              "vm": {
+                "type": "object",
+                "required": ["host"],
+                "properties": { "host": { "type": "string" } }
+              },
+              "repo": {
+                "type": "object",
+                "required": ["owner", "name", "branch"],
+                "properties": {
+                  "owner": { "type": "string" },
+                  "name": { "type": "string" },
+                  "branch": { "type": "string" }
+                }
+              },
+              "runner": {
+                "type": "object",
+                "required": ["label"],
+                "properties": { "label": { "type": "string", "enum": ["kamerta"] } }
+              },
+              "sentinel": {
+                "type": "object",
+                "required": ["mode", "cadenceMin"],
+                "properties": {
+                  "mode": { "type": "string", "enum": ["FULL", "SAFE", "DRYRUN"] },
+                  "cadenceMin": { "type": "integer", "minimum": 1 }
+                }
+              },
+              "keyVault": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string", "const": "kv-dlx-crypto" } }
+              }
+            }
+          }
+          JSON
+          cat <<'PY' > scripts/manifest_check.py
+          import argparse, json, sys
+
+          def fail(msg):
+              print(f"[manifest_check] FAIL: {msg}")
+              sys.exit(1)
+
+          def ok(msg):
+              print(f"[manifest_check] OK: {msg}")
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--manifest", required=True)
+              ap.add_argument("--schema", required=False)
+              args = ap.parse_args()
+
+              with open(args.manifest, "r", encoding="utf-8") as f:
+                  m = json.load(f)
+
+              required_top = ["version", "vm", "repo", "runner", "sentinel", "keyVault"]
+              for k in required_top:
+                  if k not in m:
+                      fail(f"Missing top-level key: {k}")
+
+              if not str(m["version"]).startswith("2."):
+                  fail("version must start with '2.'")
+
+              if m["runner"].get("label", "").lower() != "kamerta":
+                  fail("runner.label must be 'kamerta'")
+
+              kv = m.get("keyVault", {})
+              if kv.get("name") != "kv-dlx-crypto":
+                  fail("keyVault.name must be 'kv-dlx-crypto'")
+
+              mode = m["sentinel"].get("mode", "")
+              if mode not in ["FULL", "SAFE", "DRYRUN"]:
+                  fail("sentinel.mode must be FULL | SAFE | DRYRUN")
+
+              ok("Manifest structure looks valid.")
+              print(json.dumps({
+                  "host": m["vm"].get("host", "unknown"),
+                  "repo": f"{m['repo'].get('owner')}/{m['repo'].get('name')}",
+                  "branch": m["repo"].get("branch"),
+                  "mode": mode
+              }, indent=2))
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          cat <<'PY' > scripts/heartbeat_post.py
+          import argparse, json, os, sys, time
+          from urllib import request
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--host", required=True)
+              ap.add_argument("--status", required=True)
+              ap.add_argument("--note", default="")
+              args = ap.parse_args()
+
+              dv_url = os.getenv("DV_URL")
+              dv_token = os.getenv("DV_TOKEN")
+              if not dv_url or not dv_token:
+                  print("[heartbeat] Missing DV_URL or DV_TOKEN in env", file=sys.stderr)
+                  sys.exit(2)
+
+              api = dv_url.rstrip("/") + "/api/data/v9.2/dlx_heartbeats"
+              payload = {
+                  "dlx_host": args.host,
+                  "dlx_status": args.status,
+                  "dlx_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "dlx_seq": int(time.time()),
+                  "dlx_note": args.note
+              }
+              data = json.dumps(payload).encode("utf-8")
+              req = request.Request(api, data=data, method="POST", headers={
+                  "Authorization": f"Bearer {dv_token}",
+                  "Content-Type": "application/json; charset=utf-8",
+                  "OData-Version": "4.0",
+                  "Accept": "application/json"
+              })
+              try:
+                  with request.urlopen(req, timeout=30) as resp:
+                      print("[heartbeat] Sent OK:", resp.status, resp.read().decode("utf-8", "ignore"))
+              except Exception as e:
+                  print("[heartbeat] ERROR:", e, file=sys.stderr)
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          cat <<'PY' > scripts/Trigger_Listener_Script.py
+          import json, os, threading
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          from urllib.parse import urlparse, parse_qs
+          from datetime import datetime
+
+          BRIDGE = r"C:\\DLX-Bridge\\ops\\queue"
+          os.makedirs(BRIDGE, exist_ok=True)
+
+          def write_cmd(name, payload):
+              stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+              path = os.path.join(BRIDGE, f"{stamp}-{name}.json")
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(payload, f, indent=2)
+              return path
+
+          class Handler(BaseHTTPRequestHandler):
+              def _ok(self, data):
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Access-Control-Allow-Origin", "*")
+                  self.end_headers()
+                  self.wfile.write(json.dumps(data).encode("utf-8"))
+
+              def do_GET(self):
+                  u = urlparse(self.path)
+                  q = parse_qs(u.query)
+                  if u.path == "/status":
+                      data = {"host": "Kamerta", "ts": datetime.utcnow().isoformat()+"Z", "ok": True}
+                      return self._ok(data)
+
+                  if u.path == "/toggle_killswitch":
+                      val = q.get("value", [""])[0]
+                      if val not in ["0", "1"]:
+                          return self._ok({"error": "value must be 0 or 1"})
+                      p = write_cmd("killswitch", {"value": val})
+                      return self._ok({"wrote": p})
+
+                  if u.path == "/run_self_heal":
+                      p = write_cmd("run_self_heal", {"note": "manual"})
+                      return self._ok({"wrote": p})
+
+                  if u.path == "/patch_manifest":
+                      mode = q.get("mode", ["FULL"])[0]
+                      p = write_cmd("patch_manifest", {"sentinel.mode": mode})
+                      return self._ok({"wrote": p})
+
+                  self.send_response(404); self.end_headers()
+
+          def run():
+              port = 8787
+              httpd = HTTPServer(("127.0.0.1", port), Handler)
+              print(f"[Trigger Listener] http://127.0.0.1:{port}")
+              httpd.serve_forever()
+
+          if __name__ == "__main__":
+              run()
+          PY
+
+      - name: Write files — docs (dashboard)
+        shell: bash
+        run: |
+          mkdir -p docs/assets docs/status
+          cat <<'TXT' > docs/CNAME
+          apex.dlxstudios.ai
+          TXT
+
+          cat <<'HTML' > docs/index.html
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8"/>
+            <title>DLX Ops Console</title>
+            <meta name="viewport" content="width=device-width,initial-scale=1"/>
+            <link rel="stylesheet" href="assets/ops.css"/>
+          </head>
+          <body>
+            <header>
+              <h1>DLX — Self‑Heal & Runner Console</h1>
+              <div class="badges">
+                https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Dunker007/dunkerlux-shell/feature/self-heal-v0_2_0/docs/status/repo_health.json
+                <imgs://img.shields.io/github/actions/workflow/status/Dunker007/dunkerlux-shell/self_heal.yml?branch=feature%2Fself-heal-v0_2_0
+              </div>
+            </header>
+
+            <main>
+              <section id="status">
+                <h2>Status</h2>
+                <div class="grid">
+                  <div class="card">
+                    <h3>Self‑Heal</h3>
+                    <pre id="selfHeal"></pre>
+                  </div>
+                  <div class="card">
+                    <h3>Repo Health</h3>
+                    <pre id="repoHealth"></pre>
+                  </div>
+                </div>
+                <div id="tripwires" class="banner hidden"></div>
+              </section>
+
+              <section id="controls">
+                <h2>Controls (Local Kamerta)</h2>
+                <div class="controls">
+                  <button data-action="run_self_heal">Run Self‑Heal Now</button>
+                  <button data-action="killswitch_on">Kill‑Switch ON</button>
+                  <button data-action="killswitch_off">Kill‑Switch OFF</button>
+                  <button data-action="patch_full">Set Mode: FULL</button>
+                  <button data-action="patch_safe">Set Mode: SAFE</button>
+                  <button data-action="patch_dryrun">Set Mode: DRYRUN</button>
+                </div>
+                <p class="hint">Local control calls <code>http://127.0.0.1:8787</code>. Keep the Trigger Listener running on Kamerta.</p>
+              </section>
+            </main>
+
+            <footer>
+              <small>DLX Studios — Kamerta • Always‑On Write • v1.0</small>
+            </footer>
+
+            <script src="assets/ops.js"></script>
+          </body>
+          </html>
+          HTML
+
+          cat <<'CSS' > docs/assets/ops.css
+          :root { --ok:#0bb97a; --warn:#ffa502; --err:#ff4757; --bg:#0e1116; --fg:#e6edf3; --card:#151a22; }
+          *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,Segoe UI,Roboto}
+          header{padding:16px 24px;border-bottom:1px solid #222}
+          h1{margin:0 0 8px 0}
+          .badges img{margin-right:8px}
+          main{padding:16px 24px}
+          .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+          .card{background:var(--card);border:1px solid #222;border-radius:8px;padding:12px}
+          pre{white-space:pre-wrap;word-break:break-word;margin:0}
+          .banner{margin-top:12px;padding:10px;border-radius:8px}
+          .banner.warn{background:#2d270f;border:1px solid var(--warn)}
+          .banner.err{background:#2d1416;border:1px solid var(--err)}
+          .banner.hidden{display:none}
+          .controls button{margin:4px;padding:8px 10px;border:1px solid #333;background:#1a2230;color:#fff;border-radius:6px;cursor:pointer}
+          .controls button:hover{background:#223048}
+          footer{padding:12px 24px;border-top:1px solid #222;color:#aaa}
+          CSS
+
+          cat <<'JS' > docs/assets/ops.js
+          const SELF_HEAL_URL = 'https://raw.githubusercontent.com/Dunker007/dunkerlux-shell/feature/self-heal-v0_2_0/docs/status/self_heal.json';
+          const REPO_HEALTH_URL = 'https://raw.githubusercontent.com/Dunker007/dunkerlux-shell/feature/self-heal-v0_2_0/docs/status/repo_health.json';
+
+          async function fetchJson(url) {
+            const r = await fetch(url, { cache: "no-cache" });
+            if (!r.ok) throw new Error(`Fetch ${url} ${r.status}`);
+            return await r.json();
+          }
+
+          function setTripwire(msg, severity) {
+            const b = document.getElementById('tripwires');
+            b.classList.remove('hidden');
+            b.classList.toggle('warn', severity==='warn');
+            b.classList.toggle('err', severity==='err');
+            b.textContent = msg;
+          }
+
+          async function refresh() {
+            try {
+              const sh = await fetchJson(SELF_HEAL_URL);
+              document.getElementById('selfHeal').textContent = JSON.stringify(sh, null, 2);
+
+              const rh = await fetchJson(REPO_HEALTH_URL);
+              document.getElementById('repoHealth').textContent = JSON.stringify(rh, null, 2);
+
+              const last = new Date(sh.lastRunUtc || 0).getTime();
+              const ageMin = (Date.now() - last) / 60000;
+              if (sh.killswitch === "1") {
+                setTripwire("KILL-SWITCH ACTIVE — workflows will skip", "err");
+              } else if (ageMin >= 10) {
+                setTripwire(`STALE: last self-heal ${ageMin.toFixed(1)} min ago`, "warn");
+              } else {
+                document.getElementById('tripwires').classList.add('hidden');
+              }
+            } catch (e) {
+              setTripwire(`Dashboard fetch error: ${e.message}`, "warn");
+            }
+          }
+
+          async function localCall(path) {
+            try {
+              const r = await fetch(`http://127.0.0.1:8787${path}`, { mode: 'cors' });
+              const j = await r.json();
+              alert(JSON.stringify(j, null, 2));
+            } catch (e) {
+              alert("Local control unavailable. Ensure Trigger Listener is running on Kamerta.");
+            }
+          }
+
+          function wireControls() {
+            const map = {
+              run_self_heal: () => localCall('/run_self_heal'),
+              killswitch_on: () => localCall('/toggle_killswitch?value=1'),
+              killswitch_off: () => localCall('/toggle_killswitch?value=0'),
+              patch_full: () => localCall('/patch_manifest?mode=FULL'),
+              patch_safe: () => localCall('/patch_manifest?mode=SAFE'),
+              patch_dryrun: () => localCall('/patch_manifest?mode=DRYRUN')
+            };
+            document.querySelectorAll('#controls button').forEach(btn => {
+              btn.addEventListener('click', () => mapbtn.dataset.action);
+            });
+          }
+
+          wireControls();
+          refresh();
+          setInterval(refresh, 30000);
+          JS
+
+      - name: Ensure manifest placeholder exists
+        run: |
+          test -f Lux_Boot_Manifest.v2.json || cat <<'JSON' > Lux_Boot_Manifest.v2.json
+          {
+            "version": "2.0.0",
+            "vm": { "host": "Kamerta" },
+            "repo": { "owner": "Dunker007", "name": "dunkerlux-shell", "branch": "feature/self-heal-v0_2_0" },
+            "runner": { "label": "kamerta" },
+            "sentinel": { "mode": "FULL", "cadenceMin": 15 },
+            "keyVault": { "name": "kv-dlx-crypto" }
+          }
+          JSON
+
+      - name: Commit & push branch
+        run: |
+          git add .
+          git commit -m "chore(ops): stage DLX Self-Heal, dashboard, and test scenario [skip ci]" || echo "No changes to commit"
+          git push origin "${BRANCH}" --force
+
+      - name: Open/Update PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const head = process.env.BRANCH;
+            const base = context.payload.repository.default_branch;
+            const title = "DLX: Self-Heal + Dashboard + Test Scenario";
+            const body = "Automated staging of self-heal workflow, dashboard, and test scenario. This PR was opened by the Stage DLX Ops PR workflow.";
+            const prs = await github.rest.pulls.list({owner, repo, state: "open", head: `${owner}:${head}`});
+            if (prs.data.length) {
+              await github.rest.pulls.update({owner, repo, pull_number: prs.data[0].number, title, body, base});
+            } else {
+              await github.rest.pulls.create({owner, repo, head, base, title, body});
+            }
+
+      - name: Kick Repo Health on branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: "repo_health.yml", ref: process.env.BRANCH, inputs: {}
+            });
+
+      - name: Kick Self-Heal on Kamerta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: "self_heal.yml", ref: process.env.BRANCH, inputs: {}
+            });

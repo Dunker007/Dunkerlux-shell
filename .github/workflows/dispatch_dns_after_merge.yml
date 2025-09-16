@@ -1,0 +1,35 @@
+name: Dispatch DNS after Bootstrap v2 merge
+
+on:
+  push:
+    branches:
+      - $default-branch  # GitHub will expand this
+  workflow_run:
+    workflows: ["Bootstrap v2"]   # optional: if your bootstrap workflow is named "Bootstrap v2"
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    if: ${{ github.event_name == 'push' || (github.event.workflow_run.conclusion == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch dns_spaceship.yml
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner,repo] = process.env.GITHUB_REPOSITORY.split('/');
+            // create a workflow_dispatch event for the DNS workflow. [4](https://docs.github.com/en/rest/actions/workflows)
+            await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
+              owner, repo,
+              workflow_id: 'dns_spaceship.yml',
+              ref: context.payload.repository.default_branch,
+              inputs: {
+                subdomain: 'studio',
+                apex: 'true',
+                pages_path: '/docs'
+              }
+            });

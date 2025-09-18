@@ -3,7 +3,7 @@ name: DLX Production Deploy (main → deploy/coming-soon)
 on:
   push:
     branches: [ "main" ]      # deploy whenever main changes
-  workflow_dispatch: {}        # and allow manual runs
+  workflow_dispatch: {}        # allow manual runs
 
 permissions:
   contents: write
@@ -18,23 +18,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (no auto-credentials)
+      - name: Checkout repo (required)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false  # we'll push via URL token
+          persist-credentials: false  # we push via URL token
+
+      - name: Sanity check (verify git repo present)
+        run: |
+          pwd
+          ls -la
+          git rev-parse --is-inside-work-tree
 
       - name: Configure Git identity (bot)
         run: |
           git config user.name "dlx-deployer"
           git config user.email "actions@users.noreply.github.com"
 
-      # --- OPTIONAL BUILD STEP (uncomment and edit if you build) ---
+      # --- OPTIONAL BUILD STEP (uncomment if you build) ---
       # - name: Build site
       #   run: |
       #     npm ci
       #     npm run build
-      #   # Then point RSYNC_SRC to your build output dir (e.g., "dist")
+      #   # If you build, set RSYNC_SRC below to your build output dir (e.g., "$GITHUB_WORKSPACE/dist")
 
       - name: Prepare deploy worktree
         id: prep
@@ -44,14 +50,16 @@ jobs:
           WORKTREE_DIR="$(mktemp -d)"
           echo "worktree=${WORKTREE_DIR}" >> $GITHUB_OUTPUT
           echo "branch=${DEPLOY_BRANCH}" >> $GITHUB_OUTPUT
-          # If branch exists, base worktree on it; else, create from HEAD
+          # If the remote branch exists, fetch it and create a local branch to base the worktree on.
           if git ls-remote --exit-code --heads origin "${DEPLOY_BRANCH}" >/dev/null 2>&1; then
-            git fetch origin "${DEPLOY_BRANCH}":"refs/remotes/origin/${DEPLOY_BRANCH}"
-            git worktree add "${WORKTREE_DIR}" "refs/remotes/origin/${DEPLOY_BRANCH}"
-            (cd "${WORKTREE_DIR}" && git checkout -B "${DEPLOY_BRANCH}")
+            echo "Remote branch exists; fetching and creating local branch '${DEPLOY_BRANCH}'."
+            git fetch origin "${DEPLOY_BRANCH}:${DEPLOY_BRANCH}"
+            git worktree add "${WORKTREE_DIR}" "${DEPLOY_BRANCH}"
           else
+            echo "Remote branch does not exist; creating from HEAD."
             git worktree add -B "${DEPLOY_BRANCH}" "${WORKTREE_DIR}" HEAD
           fi
+
           echo "SYNC_START=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
           echo "SRC_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
@@ -60,7 +68,8 @@ jobs:
           WORKTREE_DIR: ${{ steps.prep.outputs.worktree }}
         run: |
           set -e
-          RSYNC_SRC="$GITHUB_WORKSPACE"  # change to build output dir if you build (e.g., "$GITHUB_WORKSPACE/dist")
+          # If you build, set RSYNC_SRC to your build output dir (e.g., "$GITHUB_WORKSPACE/dist")
+          RSYNC_SRC="$GITHUB_WORKSPACE"
           RSYNC_DEST="$WORKTREE_DIR"
           rsync -av --delete \
             --exclude ".git/" \
@@ -100,4 +109,8 @@ jobs:
           WORKTREE_DIR: ${{ steps.prep.outputs.worktree }}
         run: |
           set -e
-          git worktree remove -f "$WORKTREE_DIR"
+          if [ -d "$WORKTREE_DIR/.git" ]; then
+            git worktree remove -f "$WORKTREE_DIR"
+          else
+            echo "Worktree was not fully created; nothing to clean."
+          fi

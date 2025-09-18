@@ -1,0 +1,103 @@
+name: DLX Production Deploy (main → deploy/coming-soon)
+
+on:
+  push:
+    branches: [ "main" ]      # deploy whenever main changes
+  workflow_dispatch: {}        # and allow manual runs
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dlx-prod-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Sync site to deploy/coming-soon
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (no auto-credentials)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false  # we'll push via URL token
+
+      - name: Configure Git identity (bot)
+        run: |
+          git config user.name "dlx-deployer"
+          git config user.email "actions@users.noreply.github.com"
+
+      # --- OPTIONAL BUILD STEP (uncomment and edit if you build) ---
+      # - name: Build site
+      #   run: |
+      #     npm ci
+      #     npm run build
+      #   # Then point RSYNC_SRC to your build output dir (e.g., "dist")
+
+      - name: Prepare deploy worktree
+        id: prep
+        run: |
+          set -e
+          DEPLOY_BRANCH="deploy/coming-soon"
+          WORKTREE_DIR="$(mktemp -d)"
+          echo "worktree=${WORKTREE_DIR}" >> $GITHUB_OUTPUT
+          echo "branch=${DEPLOY_BRANCH}" >> $GITHUB_OUTPUT
+          # If branch exists, base worktree on it; else, create from HEAD
+          if git ls-remote --exit-code --heads origin "${DEPLOY_BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${DEPLOY_BRANCH}":"refs/remotes/origin/${DEPLOY_BRANCH}"
+            git worktree add "${WORKTREE_DIR}" "refs/remotes/origin/${DEPLOY_BRANCH}"
+            (cd "${WORKTREE_DIR}" && git checkout -B "${DEPLOY_BRANCH}")
+          else
+            git worktree add -B "${DEPLOY_BRANCH}" "${WORKTREE_DIR}" HEAD
+          fi
+          echo "SYNC_START=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+          echo "SRC_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Sync site files (exclude CI files)
+        env:
+          WORKTREE_DIR: ${{ steps.prep.outputs.worktree }}
+        run: |
+          set -e
+          RSYNC_SRC="$GITHUB_WORKSPACE"  # change to build output dir if you build (e.g., "$GITHUB_WORKSPACE/dist")
+          RSYNC_DEST="$WORKTREE_DIR"
+          rsync -av --delete \
+            --exclude ".git/" \
+            --exclude ".github/" \
+            --exclude ".gitignore" \
+            --exclude "README.md" \
+            --exclude "LICENSE" \
+            "$RSYNC_SRC"/ "$RSYNC_DEST"/
+
+      - name: Commit deploy snapshot
+        env:
+          WORKTREE_DIR: ${{ steps.prep.outputs.worktree }}
+        run: |
+          set -e
+          cd "$WORKTREE_DIR"
+          if git status --porcelain | grep .; then
+            git add -A
+            git commit -m "deploy: sync from main @ ${SRC_SHA} on ${SYNC_START} [skip ci]"
+          else
+            echo "No changes to deploy"
+          fi
+
+      - name: Push to deploy branch (GITHUB_TOKEN)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEPLOY_BRANCH: ${{ steps.prep.outputs.branch }}
+          WORKTREE_DIR: ${{ steps.prep.outputs.worktree }}
+        run: |
+          set -e
+          cd "$WORKTREE_DIR"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" HEAD:${DEPLOY_BRANCH}
+
+      - name: Cleanup worktree
+        if: always()
+        env:
+          WORKTREE_DIR: ${{ steps.prep.outputs.worktree }}
+        run: |
+          set -e
+          git worktree remove -f "$WORKTREE_DIR"

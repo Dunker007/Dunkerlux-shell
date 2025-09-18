@@ -1,0 +1,55 @@
+name: DLX Deploy Commit (Push Test via GITHUB_TOKEN)
+
+on:
+  workflow_dispatch: {}  # Manual run only while we test
+
+permissions:
+  contents: write  # enables push with GITHUB_TOKEN
+
+concurrency:
+  group: dlx-deploy-push-test
+  cancel-in-progress: false
+
+jobs:
+  push-with-github-token:
+    name: Push to deploy/coming-soon using GITHUB_TOKEN
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (no auto-credentials)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false  # we'll push via URL token
+
+      - name: Configure Git identity (bot)
+        run: |
+          git config user.name "dlx-deployer"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Ensure target branch exists locally
+        shell: bash
+        run: |
+          set -e
+          if git ls-remote --exit-code --heads origin deploy/coming-soon >/dev/null 2>&1; then
+            echo "Remote branch exists. Checking out tracking branch."
+            git fetch origin deploy/coming-soon:refs/remotes/origin/deploy/coming-soon
+            git checkout -B deploy/coming-soon origin/deploy/coming-soon
+          else
+            echo "Remote branch does not exist. Creating from current HEAD."
+            git checkout -b deploy/coming-soon
+          fi
+
+      - name: Write heartbeat (tiny, safe change)
+        run: |
+          echo "DLX heartbeat: $(date -u +'%Y-%m-%dT%H:%M:%SZ') (UTC)" > .dlx-deploy-heartbeat.txt
+          git add .dlx-deploy-heartbeat.txt
+          git commit -m "chore: heartbeat push test [skip ci] [ci skip]" || echo "Nothing to commit"
+
+      - name: Push using GITHUB_TOKEN via URL
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" HEAD:deploy/coming-soon

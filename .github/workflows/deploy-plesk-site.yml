@@ -1,126 +1,97 @@
-name: DLX — Deploy Site to Plesk (Origin CA, Full Strict)
+name: Plesk Auto-Deploy (Fetch + Deploy)
 
 on:
-  workflow_dispatch:
-    inputs:
-      domain:
-        description: "Primary domain"
-        required: true
-        default: "dlxstudios.ai"
-      repo_branch:
-        description: "Branch to deploy (for Plesk Git or SCP build artifact)"
-        required: true
-        default: "main"
-      coming_soon_dir:
-        description: "Folder with Coming Soon assets (relative to repo root)"
-        required: true
-        default: "site/coming-soon"
-      origin_ca_name:
-        description: "Name of the already-imported Origin CA certificate in Plesk"
-        required: true
-        default: "DLX-OriginCA"
+  push:
+    branches:
+      - deploy/coming-soon
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
-  PLESK_URL: ${{ vars.PLESK_URL }}           # e.g., https://<your-plesk-host>:8443
-  PLESK_API_KEY: ${{ secrets.plesk_api }}    # already created per earlier setup
-  CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}  # optional; for CF posture enforce (otherwise read-only)
-  ORIGIN_CA_CERT: ${{ secrets.ORIGIN_CA_CERT }} # present but not uploaded here (assignment assumes imported)
-  ORIGIN_CA_KEY:  ${{ secrets.ORIGIN_CA_KEY }}  # present but not uploaded here
+  # Must be ONLY host or IP (no scheme, no port)
+  PLESK_HOST: 74.208.158.134
+  # Use the domain label EXACTLY as it appears in Plesk
+  PLESK_DOMAIN: dlxstudios.ai
+  # Use the repo name shown on the Plesk Git screen
+  PLESK_REPO: dunkerlux-shell
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.repo_branch }}
-
-      - name: Resolve inputs
-        id: vars
-        run: |
-          echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
-          echo "CO_DIR=${{ github.event.inputs.coming_soon_dir }}" >> $GITHUB_ENV
-          echo "ORIGIN_CA_NAME=${{ github.event.inputs.origin_ca_name }}" >> $GITHUB_ENV
-
-      # -- Plesk: ensure domain exists (if not, create) --
-      - name: Check domain in Plesk
-        id: plesk_domain
-        shell: bash
+      - name: Show computed API endpoint (for debugging)
         run: |
           set -euo pipefail
-          HDR=(-H "Accept: application/json" -H "Content-Type: application/json" -H "X-API-Key: $PLESK_API_KEY")
-          # Query domains
-          DOM_JSON=$(curl -ks "${PLESK_URL}/api/v2/domains?name=${DOMAIN}" "${HDR[@]}")
-          ID=$(echo "$DOM_JSON" | jq -r '.[0].id // empty')
-          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
-            echo "Creating domain ${DOMAIN}..."
-            CREATE=$(curl -ks -X POST "${PLESK_URL}/api/v2/domains" "${HDR[@]}" \
-              -d "{\"name\":\"${DOMAIN}\",\"hosting_type\":\"virtual\"}")
-            ID=$(echo "$CREATE" | jq -r '.id')
-          else
-            echo "Domain ${DOMAIN} exists with id=${ID}"
-          fi
-          echo "DOMAIN_ID=$ID" >> $GITHUB_ENV
+          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
+          echo "Plesk CLI API endpoint -> ${API}"
 
-      # -- Plesk: assign existing Origin CA to the domain (fallback: Let's Encrypt) --
-      - name: Assign Origin CA certificate (by name)
-        id: assign_cert
-        shell: bash
+      - name: Probe repo info in Plesk (git --info)
         run: |
           set -euo pipefail
-          HDR=(-H "Accept: application/json" -H "Content-Type: application/json" -H "X-API-Key: $PLESK_API_KEY")
-          echo "Trying to assign Origin CA '${ORIGIN_CA_NAME}' to ${DOMAIN} ..."
-          # Use Plesk CLI via REST to assign by name
-          ASSIGN=$(curl -ks -X POST "${PLESK_URL}/api/v2/cli/certificate/call" "${HDR[@]}" \
-            -d "{\"params\":[\"--assign\",\"${ORIGIN_CA_NAME}\",\"-domain\",\"${DOMAIN}\"]}")
-          CODE=$(echo "$ASSIGN" | jq -r '.code // 1')
-          if [ "$CODE" -ne 0 ]; then
-            echo "Origin CA assignment failed (code=$CODE). Attempting temporary Let's Encrypt issuance..."
-            # Let's Encrypt via extension (email is optional; can add if desired)
-            LE=$(curl -ks -X POST "${PLESK_URL}/api/v2/cli/extension/call" "${HDR[@]}" \
-              -d "{\"params\":[\"--exec\",\"letsencrypt\",\"cli.php\",\"-d\",\"${DOMAIN}\"]}")
-            echo "LE result: $LE"
-          else
-            echo "Origin CA assigned."
-          fi
+          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
+          curl -sS -k --fail-with-body -X POST "$API" \
+            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+            -H "Content-Type: application/json" \
+            --data-raw @- <<'JSON'
+          {
+            "params": [
+              "--exec","git",
+              "--info",
+              "-domain","${PLESK_DOMAIN}",
+              "-name","${PLESK_REPO}"
+            ]
+          }
+          JSON
+      - name: Fetch latest commits into Plesk (git --fetch)
+        run: |
+          set -euo pipefail
+          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
+          curl -sS -k --fail-with-body -X POST "$API" \
+            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+            -H "Content-Type: application/json" \
+            --data-raw @- <<'JSON'
+          {
+            "params": [
+              "--exec","git",
+              "--fetch",
+              "-domain","${PLESK_DOMAIN}",
+              "-name","${PLESK_REPO}"
+            ]
+          }
+          JSON
+      - name: Deploy to /httpdocs (git --deploy)
+        run: |
+          set -euo pipefail
+          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
+          curl -sS -k --fail-with-body -X POST "$API" \
+            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+            -H "Content-Type: application/json" \
+            --data-raw @- <<'JSON'
+          {
+            "params": [
+              "--exec","git",
+              "--deploy",
+              "-domain","${PLESK_DOMAIN}",
+              "-name","${PLESK_REPO}"
+            ]
+          }
+          JSON
 
-      # -- Content deployment --
-      # Primary: Plesk Git extension pull if available; otherwise SCP fallback if secrets present
-      - name: Try Plesk Git extension (pull from repo)
-        id: plesk_git
+      - name: Log last commit (optional)
         continue-on-error: true
-        shell: bash
         run: |
-          set -euo pipefail
-          HDR=(-H "Accept: application/json" -H "Content-Type: application/json" -H "X-API-Key: $PLESK_API_KEY")
-          # This triggers the Git extension CLI to re-deploy if repo is already configured in Plesk.
-          # If not configured, this step will likely fail — the next step will fallback to SCP.
-          echo "Triggering Plesk Git extension redeploy (if configured)..."
-          curl -ks -X POST "${PLESK_URL}/api/v2/cli/extension/call" "${HDR[@]}" \
-            -d "{\"params\":[\"--exec\",\"git\",\"cli.php\",\"-d\",\"${DOMAIN}\",\"-r\",\"deploy\"]}"
-
-      - name: Deploy via SCP fallback (if SSH vars available)
-        if: steps.plesk_git.outcome == 'failure' && vars.SSH_PRIVATE_KEY != '' && vars.FTP_USERNAME != '' && vars.FTP_SERVER != ''
-        uses: celleb/plesk-deployer@v1.1
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-          ftp-username:     ${{ vars.FTP_USERNAME }}
-          ftp-server:       ${{ vars.FTP_SERVER }}
-          files-to-copy:    "${{ env.CO_DIR }}"
-          remote-dir:       "./httpdocs"
-          clean-remote-dir: false
-          restart:          false
-          npm-install:      false
-
-      # -- Cloudflare posture check (Full Strict + HSTS) --
-      - name: Cloudflare posture (read-only if no token)
-        shell: bash
-        run: |
-          echo "Ensure Cloudflare SSL mode = Full (Strict) + HSTS is enabled per dashboard/API."
-          echo "If CF_API_TOKEN is set later, I can enforce via API automatically."
+          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
+          curl -sS -k -X POST "$API" \
+            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+            -H "Content-Type: application/json" \
+            --data-raw @- <<'JSON'
+          {
+            "params": [
+              "--exec","git",
+              "--get-last-commit",
+              "-domain","${PLESK_DOMAIN}",
+              "-name","${PLESK_REPO}"
+            ]
+          }
+          JSON

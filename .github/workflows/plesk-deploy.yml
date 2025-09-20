@@ -1,0 +1,40 @@
+name: Plesk Auto-Deploy (Fetch + Deploy)
+
+on:
+  push:
+    branches:
+      - deploy/coming-soon
+
+permissions:
+  contents: read
+
+env:
+  # Use your server IP for reliability until DNS is live
+  PLESK_HOST: 74.208.158.134
+  # Use the EXACT domain label as it appears in Plesk (watch for the extra 'o' in your screenshot)
+  PLESK_DOMAIN: dlxstudios.ai
+  # Use the repo name shown in Plesk's Git screen
+  PLESK_REPO: dunkerlux-shell
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch latest from remote into Plesk repo
+        run: |
+          curl -sS -k -X POST "https://${{ env.PLESK_HOST }}:8443/api/v2/cli/extension/call" \
+            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"params\":[\"--exec\",\"git\",\"--fetch\",\"-domain\",\"${{ env.PLESK_DOMAIN }}\",\"-name\",\"${{ env.PLESK_REPO }}\"]}"
+      - name: Deploy to target directory (/httpdocs)
+        run: |
+          curl -sS -k -X POST "https://${{ env.PLESK_HOST }}:8443/api/v2/cli/extension/call" \
+            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"params\":[\"--exec\",\"git\",\"--deploy\",\"-domain\",\"${{ env.PLESK_DOMAIN }}\",\"-name\",\"${{ env.PLESK_REPO }}\"]}"
+      - name: Log last commit in Plesk (optional)
+        run: |
+          curl -sS -k -X POST "https://${{ env.PLESK_HOST }}:8443/api/v2/cli/extension/call" \
+            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"params\":[\"--exec\",\"git\",\"--get-last-commit\",\"-domain\",\"${{ env.PLESK_DOMAIN }}\",\"-name\",\"${{ env.PLESK_REPO }}\"]}"

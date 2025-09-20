@@ -1,97 +1,70 @@
-name: Plesk Auto-Deploy (Fetch + Deploy)
+name: DLX → Plesk Auto-Deploy (v2)
 
 on:
   push:
     branches:
       - deploy/coming-soon
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# --------------------------
+# CONFIGURE THESE 3 VALUES
+# --------------------------
 env:
   # Must be ONLY host or IP (no scheme, no port)
   PLESK_HOST: 74.208.158.134
-  # Use the domain label EXACTLY as it appears in Plesk
+  # Use the EXACT domain label as it appears in Plesk
   PLESK_DOMAIN: dlxstudios.ai
-  # Use the repo name shown on the Plesk Git screen
+  # Repo name shown on Plesk's Git screen
   PLESK_REPO: dunkerlux-shell
+
+  # Your public GitHub repo URL (HTTPS is fine for public repos)
+  REMOTE_REPO_URL: https://github.com/Dunker007/dunkerlux-shell.git
+  # Branch that Plesk should deploy
+  DEPLOY_BRANCH: deploy/coming-soon
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Show computed API endpoint (for debugging)
+      - name: Show computed Plesk API endpoint (debug)
         run: |
           set -euo pipefail
-          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
-          echo "Plesk CLI API endpoint -> ${API}"
+          API="https://${PLESK_HOST}:8443/api/v2"
+          echo "Plesk REST base -> ${API}"
 
-      - name: Probe repo info in Plesk (git --info)
+      - name: Smoke test REST API (auth + base URL)
         run: |
           set -euo pipefail
-          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
-          curl -sS -k --fail-with-body -X POST "$API" \
-            -H "X-API-Key: ${{ secrets.plesk_api }}" \
+          API="https://${PLESK_HOST}:8443/api/v2"
+          curl -ks --fail-with-body "${API}/cli/commands/" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
-            --data-raw @- <<'JSON'
-          {
-            "params": [
-              "--exec","git",
-              "--info",
-              "-domain","${PLESK_DOMAIN}",
-              "-name","${PLESK_REPO}"
-            ]
-          }
-          JSON
-      - name: Fetch latest commits into Plesk (git --fetch)
-        run: |
-          set -euo pipefail
-          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
-          curl -sS -k --fail-with-body -X POST "$API" \
-            -H "X-API-Key: ${{ secrets.plesk_api }}" \
-            -H "Content-Type: application/json" \
-            --data-raw @- <<'JSON'
-          {
-            "params": [
-              "--exec","git",
-              "--fetch",
-              "-domain","${PLESK_DOMAIN}",
-              "-name","${PLESK_REPO}"
-            ]
-          }
-          JSON
-      - name: Deploy to /httpdocs (git --deploy)
-        run: |
-          set -euo pipefail
-          API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
-          curl -sS -k --fail-with-body -X POST "$API" \
-            -H "X-API-Key: ${{ secrets.plesk_api }}" \
-            -H "Content-Type: application/json" \
-            --data-raw @- <<'JSON'
-          {
-            "params": [
-              "--exec","git",
-              "--deploy",
-              "-domain","${PLESK_DOMAIN}",
-              "-name","${PLESK_REPO}"
-            ]
-          }
-          JSON
+            -H "X-API-Key: ${{ secrets.plesk_api }}" >/dev/null
 
-      - name: Log last commit (optional)
-        continue-on-error: true
+      - name: Verify domain exists in Plesk
         run: |
+          set -euo pipefail
+          API="https://${PLESK_HOST}:8443/api/v2"
+          HDR=(-H "Accept: application/json" -H "Content-Type: application/json" -H "X-API-Key: ${{ secrets.plesk_api }}")
+          # Query domain by exact name
+          DOM_JSON=$(curl -ks --fail-with-body "${API}/domains?name=${PLESK_DOMAIN}" "${HDR[@]}")
+          ID=$(echo "$DOM_JSON" | jq -r '.[0].id // empty')
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            echo "::error ::Domain '${PLESK_DOMAIN}' not found in Plesk. Fix the name (watch the double 'o' typo) or create the domain first."
+            exit 1
+          fi
+          echo "Found Plesk domain '${PLESK_DOMAIN}' (id=$ID)"
+
+      - name: Ensure Plesk Git repo exists (create if missing)
+        id: ensure_repo
+        run: |
+          set -euo pipefail
           API="https://${PLESK_HOST}:8443/api/v2/cli/extension/call"
-          curl -sS -k -X POST "$API" \
-            -H "X-API-Key: ${{ secrets.plesk_api }}" \
-            -H "Content-Type: application/json" \
-            --data-raw @- <<'JSON'
-          {
-            "params": [
-              "--exec","git",
-              "--get-last-commit",
-              "-domain","${PLESK_DOMAIN}",
-              "-name","${PLESK_REPO}"
-            ]
-          }
-          JSON
+          HDR=(-H "Accept: application/json" -H "Content-Type: application/json" -H "X-API-Key: ${{ secrets.plesk_api }}")
+
+          # 1) Try git --info
+          RESP=$(curl -ks --fail-with-body -X POST "$API" "${HDR[@]}" --data-raw @- <<JSON
+          { "params": ["--exec","git

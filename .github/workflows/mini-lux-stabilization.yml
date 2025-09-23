@@ -1,0 +1,176 @@
+name: Mini-Lux v1.0 — Stabilization (dry-run)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/**"
+      - "config/**"
+      - "tools/minilux/**"
+      - "hud/**"
+      - "README.md"
+
+permissions:
+  contents: write      # for HUD commits
+  issues: write        # for Control-Hub comments/incidents
+  pull-requests: read
+
+concurrency:
+  group: "minilux-stabilization-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: Fail-Closed Gates (edge + canonical)
+    runs-on: ubuntu-latest
+    outputs:
+      canonical_ok: ${{ steps.outs.outputs.canonical_ok }}
+      edge_ok: ${{ steps.outs.outputs.edge_ok }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f tools/minilux/requirements.txt ]; then
+            pip install -r tools/minilux/requirements.txt
+          fi
+
+      - name: Canonical Auditor (fail-closed)
+        id: canonical
+        continue-on-error: true
+        run: |
+          python tools/minilux/canonical_auditor.py \
+            --config config/minilux.config.json \
+            --fail-closed
+
+      - name: Edge Audit (fail-closed)
+        id: edge
+        continue-on-error: true
+        run: |
+          python tools/minilux/edge_audit.py \
+            --config config/minilux.config.json \
+            --fail-closed
+
+      - name: Export gate outcomes
+        id: outs
+        run: |
+          echo "canonical_ok=${{ steps.canonical.outcome == 'success' }}" >> $GITHUB_OUTPUT
+          echo "edge_ok=${{ steps.edge.outcome == 'success' }}"       >> $GITHUB_OUTPUT
+
+      - name: Enforce Fail-Closed
+        if: ${{ steps.canonical.outcome != 'success' || steps.edge.outcome != 'success' }}
+        run: |
+          echo "Fail-Closed: one or more gates failed (canonical_ok=${{ steps.outs.outputs.canonical_ok }}, edge_ok=${{ steps.outs.outputs.edge_ok }})"
+          exit 1
+
+  observers:
+    name: Observers (non-blocking)
+    runs-on: ubuntu-latest
+    needs: [checks]
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f tools/minilux/requirements.txt ]; then
+            pip install -r tools/minilux/requirements.txt
+          fi
+
+      - name: Plesk Webhook Check (non-blocking)
+        continue-on-error: true
+        run: |
+          python tools/minilux/plesk_webhook_check.py \
+            --config config/minilux.config.json || true
+
+      - name: DV Sync (non-blocking; dry-run)
+        continue-on-error: true
+        run: |
+          python tools/minilux/dv_sync.py \
+            --config config/minilux.config.json || true
+
+  hud_and_comms:
+    name: HUD Update + Control-Hub Comms
+    runs-on: ubuntu-latest
+    needs: [checks, observers]
+    if: always()
+    env:
+      CANONICAL_OK: ${{ needs.checks.outputs.canonical_ok }}
+      EDGE_OK: ${{ needs.checks.outputs.edge_ok }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f tools/minilux/requirements.txt ]; then
+            pip install -r tools/minilux/requirements.txt
+          fi
+
+      - name: Update HUD JSONs (commit to branch)
+        id: hud
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANONICAL_OK: ${{ env.CANONICAL_OK }}
+          EDGE_OK: ${{ env.EDGE_OK }}
+        run: |
+          python tools/minilux/hud_update.py \
+            --config config/minilux.config.json \
+            --canonical-ok "${CANONICAL_OK}" \
+            --edge-ok "${EDGE_OK}"
+          # Commit if there are changes
+          if [[ -n "$(git status --porcelain hud)" ]]; then
+            git config user.name "mini-lux-actions"
+            git config user.email "ci@dlxstudios.ai"
+            git add hud/*.json
+            git commit -m "chore(hud): update HUD JSONs (dry-run)"
+            git push
+          fi
+
+      - name: Direct Comms → Control-Hub Issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          CANONICAL_OK: ${{ env.CANONICAL_OK }}
+          EDGE_OK: ${{ env.EDGE_OK }}
+        run: |
+          python tools/minilux/direct_comms.py \
+            --config config/minilux.config.json \
+            --post-summary \
+            --canonical-ok "${CANONICAL_OK}" \
+            --edge-ok "${EDGE_OK}"
+
+      - name: Auto-Incident on Gate Failure (issue template)
+        if: ${{ env.CANONICAL_OK != 'true' || env.EDGE_OK != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python tools/minilux/direct_comms.py \
+            --config config/minilux.config.json \
+            --open-incident \
+            --title "Mini-Lux Incident: gate failure @ $GITHUB_RUN_ID" \
+            --body "One or more gates failed. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+

@@ -11,6 +11,7 @@ env:
   AAD_APP_ID: ${{ secrets.AAD_APP_ID }}
   AAD_CLIENT_SECRET: ${{ secrets.AAD_CLIENT_SECRET }}
   DEV_ENV_URL: ${{ secrets.DEV_ENV_URL }}
+  GRAPH_USER_UPN: ${{ secrets.GRAPH_USER_UPN }} # e.g., youruser@DunkerLuxStudios.onmicrosoft.com
 
 jobs:
   probe:
@@ -18,14 +19,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (for artifact path)
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: Install PowerShell
-        uses: PowerShell/PowerShell@v1
-        with:
-          pwsh: '7.4.x'
-
+      # PowerShell is already available on ubuntu-latest; just use shell: pwsh
       - name: Generate Access Tokens (Dataverse + Graph)
         id: tokens
         shell: pwsh
@@ -34,26 +31,23 @@ jobs:
           if (-not $env:TENANT_ID -or -not $env:AAD_APP_ID -or -not $env:AAD_CLIENT_SECRET -or -not $env:DEV_ENV_URL) {
             throw "Missing one or more secrets: TENANT_ID, AAD_APP_ID, AAD_CLIENT_SECRET, DEV_ENV_URL"
           }
-          # Resource identifiers
-          $dvResource = ($env:DEV_ENV_URL.TrimEnd('/')) + "/.default"
+          $dvResource    = ($env:DEV_ENV_URL.TrimEnd('/')) + "/.default"
           $graphResource = "https://graph.microsoft.com/.default"
 
           function Get-AppToken($resource) {
-            $b = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($env:TENANT_ID)/oauth2/v2.0/token" -ContentType "application/x-www-form-urlencoded" -Body @{
+            Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($env:TENANT_ID)/oauth2/v2.0/token" -ContentType "application/x-www-form-urlencoded" -Body @{
               client_id     = $env:AAD_APP_ID
               scope         = $resource
               client_secret = $env:AAD_CLIENT_SECRET
               grant_type    = "client_credentials"
-            }
-            return $b.access_token
+            } | Select-Object -ExpandProperty access_token
           }
 
           $dvToken    = Get-AppToken $dvResource
           $graphToken = Get-AppToken $graphResource
 
-          # Save to outputs
-          echo "dv_token=$dvToken"    >> $GITHUB_OUTPUT
-          echo "graph_token=$graphToken" >> $GITHUB_OUTPUT
+          "dv_token=$dvToken"       | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "graph_token=$graphToken" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Probe Dataverse — Solutions / Env Vars / Connection References
         id: dvcheck
@@ -65,118 +59,3 @@ jobs:
 
           function Get-Dv($path) {
             Invoke-RestMethod -Headers @{ Authorization = "Bearer $dvToken" } `
-              -Uri "$dv/api/data/v9.2/$path" -Method Get
-          }
-
-          # Solutions (expect at least one DLX solution present)
-          $sol = Get-Dv "solutions?$select=uniquename,friendlyname,version&$orderby=modifiedon desc"
-          # Environment Variable Definitions & Values
-          $evd = Get-Dv "environmentvariabledefinitions?$select=schemaname,displayname"
-          $evv = Get-Dv "environmentvariablevalues?$select=environmentvariabledefinitionid,value"
-          # Connection References
-          $cr  = Get-Dv "connectionreferences?$select=connectionreferencedisplayname,connectionreferencelogicalname,connectorid,connectionid"
-
-          # Minimal heuristics for pass/fail
-          $expectedVars = @("DV_BaseUrl","Teams_ChannelId","HUD_Archive_Path")
-          $evdNames = $evd.value.schemaname
-          $missingVars = $expectedVars | Where-Object { $_ -notin $evdNames }
-
-          $hasAnySolution = $sol.value.Count -gt 0
-          $hasConnRefs    = $cr.value.Count -gt 0
-
-          # Write JSON result
-          $result = [pscustomobject]@{
-            devEnvUrl        = $dv
-            solutionsCount   = $sol.value.Count
-            expectedEnvVars  = $expectedVars
-            missingEnvVars   = $missingVars
-            connectionRefs   = $cr.value | Select-Object connectionreferencedisplayname,connectionreferencelogicalname,connectorid,connectionid
-            passSolutions    = $hasAnySolution
-            passEnvVars      = ($missingVars.Count -eq 0)
-            passConnRefs     = $hasConnRefs
-          }
-          $out = "dv-probe-result.json"
-          $result | ConvertTo-Json -Depth 6 | Out-File -FilePath $out -Encoding utf8
-
-          # Build quick Markdown summary
-          $md = @()
-          $md += "# DLX DV Probe — Dataverse Summary"
-          $md += ""
-          $md += "*Environment:* $dv"
-          $md += "*Solutions found:* $($sol.value.Count)"
-          $md += "*Connection References:* $($cr.value.Count)"
-          $md += ""
-          if ($missingVars.Count -eq 0) {
-            $md += "✅ **Environment Variables present**: $($expectedVars -join ', ')"
-          } else {
-            $md += "⚠️ **Missing Environment Variables**: $($missingVars -join ', ')"
-          }
-          if (-not $hasConnRefs) {
-            $md += "⚠️ **No Connection References found** — flows may not be portable across environments."
-          }
-          if (-not $hasAnySolution) {
-            $md += "⚠️ **No Solutions found** — move flows into a Solution for ALM."
-          }
-          $md += ""
-          $md += "See `dv-probe-result.json` for details."
-          $md -join "`n" | Out-File -FilePath "dv-probe-summary.md" -Encoding utf8
-
-      - name: Probe OneDrive HUD — write test file via Graph
-        id: graphcheck
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $graphToken = "${{ steps.tokens.outputs.graph_token }}"
-          $content    = "DLX HUD probe @ $(Get-Date -Format o)"
-          $bytes      = [System.Text.Encoding]::UTF8.GetBytes($content)
-          $folderPath = "DLX-Backups"
-          $fileName   = "dv-probe-$(Get-Date -Format yyyyMMdd-HHmmss).txt"
-
-          # Create folder if missing, then upload
-          $hdr = @{ Authorization = "Bearer $graphToken"; "Content-Type"="text/plain" }
-
-          # Ensure folder (ignore if exists)
-          try {
-            Invoke-RestMethod -Headers @{ Authorization = "Bearer $graphToken" } `
-              -Uri "https://graph.microsoft.com/v1.0/me/drive/root:/$folderPath" -Method Get | Out-Null
-          } catch {
-            Invoke-RestMethod -Headers @{ Authorization = "Bearer $graphToken"; "Content-Type"="application/json" } `
-              -Uri "https://graph.microsoft.com/v1.0/me/drive/root/children" -Method Post `
-              -Body (@{ name=$folderPath; folder=@{}; "@microsoft.graph.conflictBehavior"="fail"} | ConvertTo-Json) | Out-Null
-          }
-
-          $uri = "https://graph.microsoft.com/v1.0/me/drive/root:/$folderPath/$fileName:/content"
-          Invoke-RestMethod -Headers $hdr -Uri $uri -Method Put -InFile <(echo "$content") | Out-Null
-
-          "uploaded_file=$folderPath/$fileName" | Out-File -FilePath graph.txt -Encoding utf8
-          echo "uploaded_file=$folderPath/$fileName" >> $GITHUB_OUTPUT
-
-      - name: Produce Final Report (Markdown)
-        shell: pwsh
-        run: |
-          $dv = Get-Content dv-probe-summary.md -Raw
-          $graph = if (Test-Path graph.txt) { Get-Content graph.txt -Raw } else { "upload_failed=1" }
-          $md = @()
-          $md += "# DLX DV Probe — Final Report"
-          $md += ""
-          $md += "## Dataverse"
-          $md += $dv
-          $md += ""
-          $md += "## OneDrive HUD"
-          if ($graph -like "*upload_failed=1*") {
-            $md += "⚠️ HUD archive write **failed** — check Graph app permissions (`Files.ReadWrite.All`) and consent."
-          } else {
-            $md += "✅ HUD archive write **succeeded** — uploaded: `$(Get-Content graph.txt)`"
-          }
-          $md -join "`n" | Out-File -FilePath final-report.md -Encoding utf8
-
-      - name: Upload Probe Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dlx-dv-probe
-          path: |
-            dv-probe-result.json
-            dv-probe-summary.md
-            final-report.md
-            graph.txt

@@ -1,0 +1,80 @@
+name: DLX Monolith Splitter
+on:
+  push:
+    branches: [ deploy/coming-soon ]
+    paths:
+      - '.bootstrap/monolith.mem'
+permissions:
+  contents: write
+  issues: write
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Split monolith into files
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE=".bootstrap/monolith.mem"
+          if [ ! -f "$FILE" ]; then
+            echo "Monolith file not found: $FILE"
+            exit 1
+          fi
+          python3 - << 'PY'
+import os, io, re, pathlib
+monolith_path = ".bootstrap/monolith.mem"
+with io.open(monolith_path, "r", encoding="utf-8") as f:
+    data = f.read()
+
+files = []
+current_path = None
+buf = []
+def flush():
+    global current_path, buf, files
+    if current_path is None: return
+    outp = "/".join([p for p in current_path.split("/") if p not in ("", ".", "..")])
+    pathlib.Path(os.path.dirname(outp)).mkdir(parents=True, exist_ok=True)
+    with io.open(outp, "w", encoding="utf-8", newline="\n") as w:
+        w.write("".join(buf))
+    files.append(outp)
+    current_path = None
+    buf.clear()
+
+for line in data.splitlines(keepends=True):
+    m = re.match(r"^\s*---FILE:\s*(.+?)\s*---\s*$", line)
+    if m:
+        flush()
+        current_path = m.group(1).strip()
+        continue
+    if re.match(r"^\s*---END FILE---\s*$", line):
+        flush()
+        continue
+    if current_path is not None:
+        buf.append(line)
+
+flush()
+print("Wrote files:")
+for p in files:
+    print(" -", p)
+PY
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "DLX Monolith Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Monolith Split: expand .bootstrap/monolith.mem into files"
+            git push
+          fi
+
+      - name: Remove monolith to avoid loops
+        run: |
+          rm -f .bootstrap/monolith.mem
+          git add -A
+          git commit -m "Monolith Split: remove monolith" || true
+          git push || true

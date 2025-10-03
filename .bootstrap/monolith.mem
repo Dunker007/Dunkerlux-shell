@@ -1,227 +1,183 @@
----FILE: ops/mem/lux-mem-manifest.json---
-{
-  "capsule_id": "memsync-v2.1-2025-10-03",
-  "agent_id": "lux-2.0",
-  "paths": {
-    "root": "%USERPROFILE%/OneDrive/DLX-Backups",
-    "manifest": "%USERPROFILE%/OneDrive/DLX-Backups/agent/lux-mem-manifest.json",
-    "status": "%USERPROFILE%/OneDrive/DLX-Backups/status/lux-mem-status.json",
-    "archive": "%USERPROFILE%/OneDrive/DLX-Backups/archive",
-    "quarantine": "%USERPROFILE%/OneDrive/DLX-Backups/quarantine"
-  },
-  "control_plane": {
-    "dataverse": {
-      "solution": "DLX Core",
-      "environment": "DLX",
-      "tables": ["dlx_MemCapsules", "dlx_Agents", "dlx_SyncEvents"]
-    },
-    "flows": {
-      "push_minutes": 15,
-      "pull_minutes": 30,
-      "nightly_rescan_local_time": "02:45"
-    }
-  },
-  "conflicts": {
-    "policy": "remote-wins",
-    "exceptions": {
-      "logs": "local-wins",
-      "caches": "latest-mtime"
-    }
-  },
-  "triggers": {
-    "resume": ["Resume DeepScan-v1", "Resume DeepScan-v1.20"],
-    "panic_stop": "Mem-Sync: Off",
-    "panic_resume": "Mem-Sync: On"
-  },
-  "health": {
-    "stability_drills": ["Baseline", "Stress", "Chaos"],
-    "backoff": { "min_minutes": 5, "max_minutes": 120, "factor": 2 }
-  },
-  "telemetry": {
-    "write_status_each_cycle": true,
-    "status_fields": [
-      "cycle",
-      "last_push_utc",
-      "last_pull_utc",
-      "files_changed",
-      "dv_records_changed",
-      "errors",
-      "confidence_0to1",
-      "mode",
-      "ladder_rung"
-    ],
-    "retention": { "events_keep": 200, "archive_to": "%USERPROFILE%/OneDrive/DLX-Backups/archive" }
-  },
-  "secrets_ref": ["plesk_api", "ORIGIN_CA_CERT", "ORIGIN_CA_KEY", "CF_API_TOKEN", "LUX_GIT_WRITER"]
-}
+---FILE: .github/workflows/monolith-split-pr.yml---
+name: DLX Monolith Splitter (PR Mode)
+
+on:
+  push:
+    branches: [ deploy/coming-soon ]
+    paths:
+      - '.bootstrap/monolith.mem'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  split-open-pr:
+    name: Split monolith & open PR
+    runs-on: ubuntu-latest
+    concurrency:
+      group: monolith-split-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute branch name
+        id: vars
+        run: |
+          ts=$(date -u +"%Y%m%d-%H%M%S")
+          echo "branch=monolith-split-${ts}" >> "$GITHUB_OUTPUT"
+
+      - name: Split monolith into files
+        id: split
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE=".bootstrap/monolith.mem"
+          if [ ! -f "$FILE" ]; then
+            echo "Monolith file not found: $FILE"
+            exit 1
+          fi
+
+          python3 - << 'PY'
+import os, io, re, pathlib
+
+monolith_path = ".bootstrap/monolith.mem"
+out_list_path = ".github/monolith_split_files.txt"
+pathlib.Path(os.path.dirname(out_list_path)).mkdir(parents=True, exist_ok=True)
+
+with io.open(monolith_path, "r", encoding="utf-8") as f:
+    data = f.read()
+
+files = []
+current_path = None
+buf = []
+
+def flush():
+    global current_path, buf, files
+    if current_path is None:
+        return
+    outp = "/".join([p for p in current_path.split("/") if p not in ("", ".", "..")])
+    d = os.path.dirname(outp)
+    if d:
+        pathlib.Path(d).mkdir(parents=True, exist_ok=True)
+    with io.open(outp, "w", encoding="utf-8", newline="\n") as w:
+        w.write("".join(buf))
+    files.append(outp)
+    buf.clear()
+
+for line in data.splitlines(keepends=True):
+    m = re.match(r"^\s*---FILE:\s*(.+?)\s*---\s*$", line)
+    if m:
+        flush()
+        current_path = m.group(1).strip()
+        continue
+    if re.match(r"^\s*---END FILE---\s*$", line):
+        flush()
+        current_path = None
+        continue
+    if current_path is not None:
+        buf.append(line)
+
+flush()
+
+with io.open(out_list_path, "w", encoding="utf-8", newline="\n") as w:
+    for p in files:
+        w.write(p + "\n")
+
+print("Wrote files:")
+for p in files:
+    print(" -", p)
+PY
+
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          cat .github/monolith_split_files.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create branch and commit changes
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.vars.outputs.branch }}"
+          git switch -c "$BRANCH"
+          git config user.name "DLX Monolith Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          # Remove the monolith within the PR so base never keeps it
+          git rm -f .bootstrap/monolith.mem || true
+          git add -A
+          git commit -m "Monolith Split (PR): expand and remove .bootstrap/monolith.mem"
+          git push --set-upstream origin "$BRANCH"
+
+      - name: Open Pull Request
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ steps.vars.outputs.branch }}
+          base: deploy/coming-soon
+          title: "Monolith Split: expand .bootstrap/monolith.mem into files"
+          body: |
+            This PR was auto-created by **DLX Monolith Splitter (PR Mode)**.
+
+            **Summary**
+            - Expanded `.bootstrap/monolith.mem` into versioned files
+            - Removed `.bootstrap/monolith.mem` in this PR branch (prevents re-triggers)
+            - Target base: `deploy/coming-soon`
+
+            **Files written**
+            ```
+            ${{ steps.split.outputs.files }}
+            ```
+
+            _Merging this PR finalizes the split and removes the monolith from the deploy branch._
+          labels: ops, mem, monolith-split
+          draft: false
+
+      - name: Enable auto-merge (squash)
+        if: ${{ steps.cpr.outputs['pull-request-number'] }}
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          pull-request-number: ${{ steps.cpr.outputs['pull-request-number'] }}
+          merge-method: squash
+
+      - name: Echo PR URL
+        run: echo "PR URL: ${{ steps.cpr.outputs.pull-request-url }}"
 ---END FILE---
 
----FILE: ops/mem/lux-mem-status.sample.json---
-{
-  "agent_id": "lux-2.0",
-  "capsule_id": "memsync-v2.1-2025-10-03",
-  "cycle": 1,
-  "mode": "Baseline",
-  "last_pull_utc": "2025-10-03T15:10:00Z",
-  "last_push_utc": "2025-10-03T15:25:00Z",
-  "files_changed": { "pulled": 0, "pushed": 0, "conflicts": 0, "quarantined": 0 },
-  "dv_records_changed": { "pulled": 0, "pushed": 0, "errors": 0 },
-  "ladder_rung": "L2",
-  "backoff_minutes": 0,
-  "errors": [],
-  "confidence_0to1": 0.90,
-  "next_scheduled_local": "2025-10-03T10:45:00-05:00"
-}
+---FILE: .github/workflows/monolith-split.yml---
+# DISABLED: replaced by PR Mode workflow.
+# Keeping file for history; now runs only on manual dispatch.
+name: DLX Monolith Splitter (LEGACY - Disabled)
+on:
+  workflow_dispatch: {}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Legacy monolith splitter disabled. Use monolith-split-pr.yml (PR Mode)."
 ---END FILE---
 
----FILE: docs/ops/backbone.md---
-# Lux 2.0 — Backbone & Authority Capsule (Write‑Blocked Safe)
-**Version:** v2.1 · **Date:** 2025‑10‑03
+---FILE: docs/ops/monolith-pr-mode.md---
+# DLX Monolith — PR Mode
 
-## Purpose
-Operate hands‑off even when the OS filesystem is denied. Use a **Write Bus** with a **Storage Ladder** and keep syncing via DV/GitHub until OneDrive/local are writable.
+**What it does**
+- Expands `.bootstrap/monolith.mem` into versioned files on a temp branch.
+- Removes the monolith in the PR branch.
+- Opens a **Pull Request** targeting `deploy/coming-soon`.
+- **Auto-merges** (squash) when checks pass.
 
-## Control Plane
-- **Authoritative:** Dataverse + Power Automate (DV‑first)
-- **Operational State:** OneDrive `/DLX-Backups` (manifest controls cadence) — when available
-- **Deploy Pattern:** Plesk Git auto‑pull (webhook) — separate from memory
-- **Edge:** Cloudflare Full (Strict) + HSTS
-- **Conflict:** remote‑wins (logs=local‑wins, caches=latest‑mtime)
-- **Secrets:** refer by logical name only → `plesk_api`, `ORIGIN_CA_CERT`, `ORIGIN_CA_KEY`, `CF_API_TOKEN`, `LUX_GIT_WRITER`
+**How to use**
+1. Create `.bootstrap/monolith.mem` on `deploy/coming-soon`.
+2. Wait for **DLX Monolith Splitter (PR Mode)** to open a PR.
+3. PR auto-merges when checks are green. Result: files on `deploy/coming-soon`, monolith gone.
 
-## Storage Ladder (L0→L4)
-- **L0 – Local** (optional cache). If write fails → climb.
-- **L1 – OneDrive via Flow (Graph proxy).**
-- **L2 – Dataverse Attachments** (durable fallback).
-- **L3 – GitHub PR/Files** (`/ops/mem/*`, branch `deploy/coming-soon`).
-- **L4 – GitHub Issue Log** (store‑of‑last‑resort).
-
-Write heartbeat every cycle to DV (`dlx_SyncEvents`) and to the highest reachable rung. Re‑probe upward every 30 minutes.
-
-## Triggers
-- `Backbone: Arm` — enable Backbone + Write Bus; self‑install manifest across ladder.
-- `Mem‑Sync: On` / `Mem‑Sync: Off` — start/stop cadence.
-- `Resume DeepScan‑v1` / `Resume DeepScan‑v1.20` — immediate pull+push; log `rescan`.
-- `Force Ladder: L{0..4}` — override rung for next 3 cycles.
-- `Proof Mode: Start/Stop` — increase logging; write to ≥2 rungs per cycle.
-- `Panic: Quarantine {reason}` — quarantine immediately (no hard deletes).
-
-## Success Criteria
-Within 30 minutes of `Backbone: Arm` + `Mem‑Sync: On`:
-- ≥1 pull and ≥1 push in `dlx_SyncEvents`.
-- Heartbeat written to at least one **non‑local** rung if local is blocked.
-- `ladder_rung` accurately reported; timestamps ≤60s drift.
-- Quarantine path verified at least once (optional).
+**Why PR Mode**
+- Traceability (PR links for audits).
+- Branch protection compliant.
+- Safer than direct commits.
 ---END FILE---
-
----FILE: docs/ops/mem-sync.md---
-# Lux 2.0 — Mem‑Sync Policy (v2.1)
-
-## Cadence
-- Push → every **15m**
-- Pull ← every **30m**
-- Nightly full rescan at **02:45 local**
-- Backoff if offline: **5m → 10m → 20m → 40m → 80m → 120m**, then hold
-- Drills: **Baseline**, **Stress**, **Chaos**
-
-## Conflicts
-- **remote‑wins**
-- Exceptions: **logs = local‑wins**, **caches = latest‑mtime**
-- **No hard deletes**; quarantine unknowns
-
-## Observability
-- Heartbeat JSON each cycle → prefer OneDrive status file; fallback to DV attachment or GitHub file/Issue.
-- Mirror high‑signal events to DV table **`dlx_SyncEvents`** (keep last 200; archive older).
-
-## Triggers
-- `Mem‑Sync: On` / `Mem‑Sync: Off`
-- `Resume DeepScan‑v1` / `Resume DeepScan‑v1.20`
-
-## Acceptance Test
-1. Ensure manifest exists (`ops/mem/lux-mem-manifest.json`).
-2. Enable `Mem‑Sync: On`; expect first pull within **≤30m** (≤10m warm).
-3. Change probe: add `DLX-Backups/notes/_probe.txt` and a DV `dlx_MemCapsules` record (`key=probe`).
-4. Run `Resume DeepScan‑v1`; expect immediate **pull+push** and `rescan` event.
-5. Drop malformed JSON in `/agent` (or DV attachment); expect **quarantine** event.
-6. Toggle `Mem‑Sync: Off` then `On`; verify cycles pause/resume.
-
-**Pass** when: ≥1 pull + ≥1 push in ≤30m, heartbeat sane (≤60s drift), DV shows events (push, pull, rescan).
----END FILE---
-
----FILE: ops/mem/capsules/king-kong-backbone.txt---
-╔════════════════════════════════════════════════════════════════════╗
-║   LUX 2.0 — BACKBONE & AUTHORITY CAPSULE (Write‑Blocked Safe)     ║
-║           v2.1 · “King‑Kong Core” · 2025‑10‑03                    ║
-╚════════════════════════════════════════════════════════════════════╝
-PURPOSE
-Operate hands‑off using a resilient Write Bus with a Storage Ladder. If the OS filesystem is denied, continue by writing to DV, then GitHub, then other out‑of‑band channels. No hard stops for local‑write failures.
-
-CONTROL PLANE (ANCHORS)
-• Dataverse + Power Automate (DV‑first)
-• OneDrive /DLX-Backups (manifest controls cadence) — when available
-• Plesk Git auto‑pull (webhook) — separate from memory
-• Cloudflare Full (Strict) + HSTS
-• Conflict: remote‑wins; exceptions logs=local‑wins, caches=latest‑mtime
-• Secrets (logical names): plesk_api, ORIGIN_CA_CERT, ORIGIN_CA_KEY, CF_API_TOKEN, LUX_GIT_WRITER
-
-WRITE BUS — STORAGE LADDER (AUTO & MANUAL)
-Try L0→L4 in order; stay at the highest working rung and re‑probe upward:
-• L0—Local (optional cache) → if blocked, skip to L1
-• L1—OneDrive via Flow (Graph proxy) → if no ack in 5m, L2
-• L2—DV Attachments → durable
-• L3—GitHub PR / files under /ops/mem/* (branch deploy/coming-soon)
-• L4—GitHub Issue log (pinned), mirror to dlx_SyncEvents type="oob_log"
-
-SYNC CADENCE
-Push 15m, Pull 30m, Rescan 02:45 local; backoff 5→120m; drills Baseline/Stress/Chaos
-
-HEARTBEAT (MULTI‑SINK)
-Every cycle write heartbeat to DV dlx_SyncEvents and to the highest reachable rung (OneDrive, DV attachment, GitHub file, or Issue). Include ladder_rung and confidence.
-
-TRIGGERS
-"Backbone: Arm", "Mem‑Sync: On/Off", "Resume DeepScan‑v1(/v1.20)", "Force Ladder: L{0..4}", "Proof Mode: Start/Stop", "Panic: Quarantine {reason}"
-
-SUCCESS CRITERIA (30m window)
-≥1 pull + ≥1 push; heartbeat to non‑local sink if local is blocked; timestamps ≤60s drift; quarantine verified once.
-END OF CAPSULE
----END FILE---
-
----FILE: docs/ops/dv-schema.yaml---
-dlx_Agents:
-  - agent_id        # key
-  - name
-  - status          # enabled | disabled | degraded
-  - last_seen_utc
-  - version
-
-dlx_MemCapsules:
-  - capsule_id      # key
-  - agent_id        # lookup -> dlx_Agents
-  - key             # atomic memory key (short)
-  - value           # factual content
-  - source          # OneDrive | DV | Manual | System | GitHub
-  - updated_utc
-  - ttl_days        # null=infinite
-
-dlx_SyncEvents:
-  - event_id        # key
-  - capsule_id      # lookup -> dlx_MemCapsules
-  - agent_id        # lookup -> dlx_Agents
-  - type            # push | pull | rescan | backoff | error | quarantine | write_request | oob_log
-  - ts_utc
-  - details_json    # payload / deltas / error messages
----END FILE---
-
----FILE: docs/flows/onedrive-write-proxy.md---
-# Flow Spec — OneDrive Write Proxy (Graph)
-**Trigger:** When a row is added to DV table `dlx_SyncEvents` with `type = "write_request"`  
-**Expected `details_json` schema:**
-
-{
-  "target": "OneDrive",
-  "file_path": "%USERPROFILE%/OneDrive/DLX-Backups/status/lux-mem-status.json",
-  "op": "write",                     // "write" | "append"
-  "content_base64": "…",
-  "content_type": "application/json",
-  "ts_utc": "2025-10-03T15:12:00Z"
-}
